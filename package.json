@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "deploy": "node -e \"const fs=require('fs'),v=JSON.parse(fs.readFileSync('version.json'));v.version++;fs.writeFileSync('version.json',JSON.stringify(v,null,2)+'\\n');console.log('Version bumped to v'+v.version)\" && vercel --prod",
+    "deploy": "bash scripts/deploy.sh",
     "start": "next start",
     "lint": "next lint"
   },

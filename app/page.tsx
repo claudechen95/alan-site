@@ -460,7 +460,7 @@ export default function HomePage() {
         </div>
       ) : (
         <div className="space-y-4">
-          {goals.map((goal) =>
+          {[...goals].sort((a, b) => Number(a.isDone) - Number(b.isDone)).map((goal) =>
             editingId === goal.id ? (
               <HabitForm
                 key={goal.id}
