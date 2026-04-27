@@ -460,7 +460,10 @@ export default function HomePage() {
         </div>
       ) : (
         <div className="space-y-4">
-          {[...goals].sort((a, b) => Number(a.isDone) - Number(b.isDone)).map((goal) =>
+          {[...goals].sort((a, b) => {
+            const handled = (g: GoalStatus) => g.isDone || (g.frequency === "weekly" && g.targetCount > 1 && g.todayCount >= 1);
+            return Number(handled(a)) - Number(handled(b));
+          }).map((goal) =>
             editingId === goal.id ? (
               <HabitForm
                 key={goal.id}
