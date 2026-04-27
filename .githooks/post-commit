@@ -1,5 +1,9 @@
 #!/bin/bash
-set -e
+
+# Skip if this is already a version bump commit
+if git log -1 --pretty=%s | grep -q "^chore: bump to v"; then
+  exit 0
+fi
 
 VERSION=$(node -e "
 const fs = require('fs');
@@ -9,6 +13,6 @@ fs.writeFileSync('version.json', JSON.stringify(v, null, 2) + '\n');
 process.stdout.write(String(v.version));
 ")
 
-echo "→ Bumped to v$VERSION"
+echo "→ Auto-bumped to v$VERSION"
 git add version.json
-git commit --amend --no-edit
+git commit -m "chore: bump to v$VERSION"
