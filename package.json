@@ -7,7 +7,8 @@
     "build": "next build",
     "deploy": "bash scripts/deploy.sh",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "prepare": "git config core.hooksPath .githooks"
   },
   "dependencies": {
     "@upstash/redis": "^1.34.0",
