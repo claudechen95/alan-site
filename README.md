@@ -54,4 +54,3 @@ To add or change goals, `POST /api/goals` with:
 To delete: `DELETE /api/goals` with `{ "id": "my-goal" }`.
 
 > A future admin UI can be added for managing goals without needing to hit the API directly.
-
