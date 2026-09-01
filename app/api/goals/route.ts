@@ -1,5 +1,14 @@
 import { NextResponse } from "next/server";
-import { getGoals, saveGoals, getGoalStatuses, renumberGoals, resolveUser } from "@/lib/kv";
+import {
+  getGoals,
+  saveGoals,
+  getGoalStatuses,
+  renumberGoals,
+  resolveUser,
+  graduateGoal,
+  ungraduateGoal,
+  snoozeGraduation,
+} from "@/lib/kv";
 
 export async function GET(req: Request) {
   try {
@@ -37,7 +46,17 @@ export async function POST(req: Request) {
 export async function PATCH(req: Request) {
   try {
     const user = resolveUser(new URL(req.url).searchParams.get("user"));
-    const { orderedIds } = await req.json();
+    const { orderedIds, goalId, graduation } = await req.json();
+
+    // Graduation actions: graduate | ungraduate | snooze, all keyed on a single goal.
+    if (goalId && graduation) {
+      if (graduation === "graduate") await graduateGoal(goalId, user);
+      else if (graduation === "ungraduate") await ungraduateGoal(goalId, user);
+      else if (graduation === "snooze") await snoozeGraduation(goalId, user);
+      else return NextResponse.json({ error: "Unknown graduation action" }, { status: 400 });
+      return NextResponse.json({ ok: true });
+    }
+
     if (!Array.isArray(orderedIds)) {
       return NextResponse.json({ error: "orderedIds required" }, { status: 400 });
     }

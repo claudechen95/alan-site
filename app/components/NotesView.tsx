@@ -1,19 +1,31 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import type { WeeklyNote } from "@/lib/types";
 
 const PST = "America/Los_Angeles";
 
+// ISO-8601 week key - must stay in step with getWeekKey in lib/kv.ts, which is what the notes
+// API actually reads and writes. See the comment there for why ISO is the convention.
 function getWeekKeyForDate(date: Date): string {
-  const pst = new Date(date.toLocaleString("en-US", { timeZone: PST }));
-  const y = pst.getFullYear();
-  const jan4 = new Date(y, 0, 4);
-  const daysDiff = Math.floor((pst.getTime() - jan4.getTime()) / 86400000);
-  const week = Math.ceil((daysDiff + jan4.getDay() + 1) / 7);
-  return `${y}-W${String(week).padStart(2, "0")}`;
+  const [y, m, d] = new Intl.DateTimeFormat("en-CA", { timeZone: PST })
+    .format(date)
+    .split("-")
+    .map(Number);
+
+  const thursday = new Date(Date.UTC(y, m - 1, d));
+  thursday.setUTCDate(thursday.getUTCDate() - ((thursday.getUTCDay() + 6) % 7) + 3);
+  const isoYear = thursday.getUTCFullYear();
+
+  const week1Thursday = new Date(Date.UTC(isoYear, 0, 4));
+  week1Thursday.setUTCDate(week1Thursday.getUTCDate() - ((week1Thursday.getUTCDay() + 6) % 7) + 3);
+
+  const week = Math.round((thursday.getTime() - week1Thursday.getTime()) / (7 * 86400000)) + 1;
+  return `${isoYear}-W${String(week).padStart(2, "0")}`;
 }
 
+// Inverse of the above: week 1 is the week containing Jan 4, so its Monday is the Monday on or
+// before Jan 4. Already ISO-correct - it was getWeekKeyForDate that disagreed with it.
 function getMondayOfWeek(weekKey: string): Date {
   const [year, weekStr] = weekKey.split("-W");
   const week = parseInt(weekStr, 10);
@@ -61,17 +73,8 @@ function NoteForm({
 }) {
   const [headline, setHeadline] = useState(initial?.headline ?? "");
   const [notes, setNotes] = useState(initial?.notes ?? "");
-  const [changes, setChanges] = useState<string[]>(initial?.changes ?? [""]);
   const [saving, setSaving] = useState(false);
   const q = userId ? `?user=${encodeURIComponent(userId)}` : "";
-
-  const updateChange = (i: number, val: string) => {
-    const next = [...changes];
-    next[i] = val;
-    setChanges(next);
-  };
-
-  const removeChange = (i: number) => setChanges(changes.filter((_, idx) => idx !== i));
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -83,7 +86,9 @@ function NoteForm({
         week: weekKey,
         headline,
         notes,
-        changes: changes.filter((c) => c.trim()),
+        // The progress log was retired - new notes never add one. Existing notes keep theirs,
+        // so editing one has to pass the old lines back through rather than blank them out.
+        changes: initial?.changes ?? [],
       }),
     });
     setSaving(false);
@@ -108,33 +113,9 @@ function NoteForm({
         placeholder="Notes (optional)"
         value={notes}
         onChange={(e) => setNotes(e.target.value)}
-        rows={3}
+        rows={6}
         className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-indigo-300 resize-none"
       />
-      <div className="space-y-2">
-        <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">Progress Log</p>
-        {changes.map((c, i) => (
-          <div key={i} className="flex gap-2">
-            <input
-              type="text"
-              value={c}
-              onChange={(e) => updateChange(i, e.target.value)}
-              placeholder="e.g. ✅ Completed protein goal"
-              className="flex-1 border border-gray-200 rounded-xl px-3 py-1.5 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-indigo-300"
-            />
-            {changes.length > 1 && (
-              <button type="button" onClick={() => removeChange(i)} className="text-gray-300 hover:text-red-400 text-lg leading-none">×</button>
-            )}
-          </div>
-        ))}
-        <button
-          type="button"
-          onClick={() => setChanges([...changes, ""])}
-          className="text-xs text-indigo-400 hover:text-indigo-600 underline"
-        >
-          + add line
-        </button>
-      </div>
       <div className="flex gap-2 pt-1">
         <button
           type="submit"
@@ -225,7 +206,8 @@ function NoteCard({ note, onEdit }: { note: WeeklyNote; onEdit: () => void }) {
             {note.notes && (
               <p className="text-sm text-gray-700 mb-4 leading-relaxed">{note.notes}</p>
             )}
-            {note.changes.length > 0 && (
+            {/* Retired - kept so notes written before the progress log was removed still render. */}
+            {note.changes?.length > 0 && (
               <div className="bg-gray-50 rounded-xl p-3">
                 <p className="text-xs font-medium text-gray-500 mb-2 uppercase tracking-wide">Progress Log</p>
                 <ul className="space-y-2">
@@ -261,16 +243,16 @@ export function NotesPage({ userId }: { userId?: string }) {
 
   const q = userId ? `?user=${encodeURIComponent(userId)}` : "";
 
-  const load = () => {
+  const load = useCallback(() => {
     setLoading(true);
     fetch(`/api/notes${q}`)
       .then((r) => r.json())
       .then((data) => setNotes(data))
       .catch(() => setError("Couldn't load notes."))
       .finally(() => setLoading(false));
-  };
+  }, [q]);
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); }, [load]);
 
   const existingWeeks = new Set(notes.map((n) => n.week));
 
@@ -332,7 +314,7 @@ export function NotesPage({ userId }: { userId?: string }) {
         <div className="text-center py-12">
           <div className="text-4xl mb-3">📝</div>
           <p className="text-gray-500">No weekly notes yet.</p>
-          <p className="text-sm text-gray-400 mt-1">Tap "+ new note" to add your first reflection.</p>
+          <p className="text-sm text-gray-400 mt-1">Tap “+ new note” to add your first reflection.</p>
         </div>
       )}
 

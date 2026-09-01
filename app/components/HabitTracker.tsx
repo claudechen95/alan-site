@@ -1,5 +1,6 @@
 "use client";
 
+import type { ReactNode } from "react";
 import { useEffect, useState, useCallback, useRef } from "react";
 import {
   DndContext,
@@ -20,7 +21,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import versionData from "@/version.json";
-import type { Goal, GoalStatus } from "@/lib/types";
+import type { Goal, GoalStatus, ReflectionPrompt } from "@/lib/types";
 import type { VacationWindow } from "@/lib/kv";
 import { EmotionWheel, MoodModal } from "@/app/components/MoodModal";
 
@@ -43,6 +44,18 @@ function addDaysToDateStr(dateStr: string, days: number): string {
 
 function isHandled(g: GoalStatus): boolean {
   return g.isDone || (g.frequency === "weekly" && g.targetCount > 1 && g.todayCount >= 1);
+}
+
+// A habit's run, in whichever unit its frequency is scored in - days for daily, weeks for
+// weekly. `streak` carries the live run while a habit is tracked and the frozen one after it
+// graduates, so both cases read the same field.
+function runLabel(g: GoalStatus): string {
+  return `${g.streak}${g.frequency === "daily" ? "d" : "w"}`;
+}
+
+function runText(g: GoalStatus): string {
+  const unit = g.frequency === "daily" ? "day" : "week";
+  return `${g.streak} ${unit}${g.streak === 1 ? "" : "s"} straight`;
 }
 
 function formatPeriod(frequency: "daily" | "weekly"): string {
@@ -241,31 +254,169 @@ function HabitForm({
   );
 }
 
+// Graduated habits, as a shelf of medallions above the active list. Collapsible because the
+// shelf only ever grows: left open forever it would eventually push the habits still being
+// worked on below the fold, which is exactly backwards for a tracker's home screen.
+function TrophyShelf({
+  goals,
+  onUngraduate,
+  loading,
+}: {
+  goals: GoalStatus[];
+  onUngraduate: (id: string) => void;
+  loading: boolean;
+}) {
+  const [open, setOpen] = useState(true);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const selected = goals.find((g) => g.id === selectedId) ?? null;
+
+  return (
+    <section className="mb-6">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="flex items-center gap-1.5 text-xs font-medium text-amber-700 hover:text-amber-800 transition-colors"
+      >
+        <span aria-hidden>🏆</span>
+        <span>Graduated · {goals.length}</span>
+        <svg
+          className={`w-3 h-3 transition-transform duration-200 ${open ? "" : "-rotate-90"}`}
+          viewBox="0 0 12 12"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={2}
+          aria-hidden
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" d="M3 4.5L6 7.5L9 4.5" />
+        </svg>
+      </button>
+
+      {open && (
+        <div className="mt-2.5">
+          <div className="flex gap-2 overflow-x-auto pb-1">
+            {goals.map((g) => {
+              const isSelected = g.id === selectedId;
+              return (
+                <button
+                  key={g.id}
+                  onClick={() => setSelectedId(isSelected ? null : g.id)}
+                  aria-pressed={isSelected}
+                  className={`flex-shrink-0 w-[4.25rem] rounded-xl border px-2 py-2 flex flex-col items-center gap-0.5 transition-colors ${
+                    isSelected
+                      ? "border-amber-400 bg-amber-100"
+                      : "border-amber-200 bg-amber-50 hover:bg-amber-100"
+                  }`}
+                >
+                  <span className="text-2xl leading-none">{g.emoji}</span>
+                  <span className="text-[10px] font-medium text-amber-700 tabular-nums">{runLabel(g)}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {selected && (
+            <div className="mt-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5">
+              <p className="text-sm font-medium text-gray-900 break-words">
+                <span className="mr-1.5">{selected.emoji}</span>
+                {selected.name}
+              </p>
+              <p className="text-xs text-gray-500 mt-0.5">
+                {runText(selected)}
+                {selected.graduatedAt && (
+                  <>
+                    {" · graduated "}
+                    {new Date(selected.graduatedAt + "T12:00:00").toLocaleDateString("en-US", {
+                      month: "short",
+                      day: "numeric",
+                    })}
+                  </>
+                )}
+              </p>
+              <button
+                onClick={() => onUngraduate(selected.id)}
+                disabled={loading}
+                className="mt-2 text-xs text-gray-400 hover:text-gray-600 underline disabled:opacity-50"
+              >
+                start tracking again
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// What the prompt actually says, which depends on why we're asking. A weekly habit isn't
+// "missed" because of one skipped day, so it gets the arithmetic that made us ask instead.
+function reflectionPromptText(prompt: ReflectionPrompt): ReactNode {
+  const days = (n: number) => `${n} ${n === 1 ? "day" : "days"}`;
+
+  if (prompt.reason === "missed-day") {
+    const weekday = new Date(prompt.date + "T12:00:00").toLocaleDateString("en-US", { weekday: "long" });
+    return (
+      <>
+        <span className="font-medium">{weekday}</span> you missed this. What got in the way?
+      </>
+    );
+  }
+
+  if (prompt.reason === "week-missed") {
+    return (
+      <>
+        Last week you got <span className="font-medium">{prompt.completed} of {prompt.target}</span>.
+        What got in the way?
+      </>
+    );
+  }
+
+  const behind = prompt.target - prompt.completed > prompt.daysLeft;
+  return behind ? (
+    <>
+      You’re at <span className="font-medium">{prompt.completed} of {prompt.target}</span> this week
+      with only {days(prompt.daysLeft)} left - this one’s out of reach now. What got in the way?
+    </>
+  ) : (
+    <>
+      You’re at <span className="font-medium">{prompt.completed} of {prompt.target}</span> this week
+      with {days(prompt.daysLeft)} left - every remaining day has to count. What’s getting in the way?
+    </>
+  );
+}
+
+// Enough to be a thought rather than a keystroke, low enough that one honest sentence clears it.
+const MIN_REFLECTION_CHARS = 15;
+
 function ReflectionModal({
   goal,
+  prompt,
   onSubmit,
   onSkip,
-  onClose,
+  onDismiss,
 }: {
   goal: GoalStatus;
+  prompt: ReflectionPrompt;
   onSubmit: (text: string) => void;
   onSkip: () => void;
-  onClose: () => void;
+  onDismiss: () => void;
 }) {
   const [text, setText] = useState("");
   useEffect(() => {
     document.body.style.overflow = "hidden";
     return () => { document.body.style.overflow = ""; };
   }, []);
-  const today = getTodayPST();
-  const yesterday = new Date(today);
-  yesterday.setDate(today.getDate() - 1);
-  const periodLabel = yesterday.toLocaleDateString("en-US", { weekday: "long" });
+
+  // A required prompt still closes - the user is never trapped in a modal. What it won't do is
+  // hand over the check-in on the way out. Backing out leaves the habit unchecked, so the only
+  // path to the green tick is writing the thing. That's the difference between a required
+  // reflection and the old skip link, which gave away the check-in for a single tap.
+  const short = text.trim().length < MIN_REFLECTION_CHARS;
+  const blocked = prompt.required && short;
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4"
-      onClick={(e) => e.target === e.currentTarget && onClose()}
+      onClick={(e) => e.target === e.currentTarget && onDismiss()}
     >
       <div className="w-full max-w-sm rounded-2xl bg-white shadow-xl p-6 space-y-4">
         <div className="flex items-start justify-between">
@@ -274,22 +425,24 @@ function ReflectionModal({
             <h2 className="text-base font-semibold text-gray-900">{goal.name}</h2>
           </div>
           <button
-            onClick={onClose}
+            onClick={onDismiss}
+            aria-label="Close"
             className="text-gray-400 hover:text-gray-600 transition-colors text-lg leading-none"
           >
             ✕
           </button>
         </div>
 
-        <p className="text-sm text-gray-700">
-          <span className="font-medium">{periodLabel}</span> you missed this.{" "}
-          What got in the way?
-        </p>
+        <p className="text-sm text-gray-700">{reflectionPromptText(prompt)}</p>
 
         <textarea
           value={text}
           onChange={(e) => setText(e.target.value)}
-          placeholder="Optional — just thinking out loud is enough"
+          placeholder={
+            prompt.required
+              ? "A sentence is plenty - what actually happened?"
+              : "Optional - just thinking out loud is enough"
+          }
           rows={3}
           className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm text-gray-900 placeholder-gray-400 resize-none focus:outline-none focus:ring-2 focus:ring-gray-300"
           autoFocus
@@ -298,16 +451,25 @@ function ReflectionModal({
         <div className="flex flex-col gap-2">
           <button
             onClick={() => onSubmit(text)}
-            className="w-full bg-gray-900 text-white rounded-xl py-2 text-sm font-medium hover:bg-gray-700 transition-colors"
+            disabled={blocked}
+            className="w-full bg-gray-900 text-white rounded-xl py-2 text-sm font-medium hover:bg-gray-700 disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed transition-colors"
           >
             {text.trim() ? "Save & Check In" : "Check In"}
           </button>
-          <button
-            onClick={onSkip}
-            className="text-xs text-gray-400 hover:text-gray-600 underline transition-colors"
-          >
-            just check in, skip reflection
-          </button>
+          {prompt.required ? (
+            <p className="text-xs text-gray-400 text-center">
+              {blocked
+                ? "This one needs a reflection before it counts."
+                : "Checking in will save this reflection."}
+            </p>
+          ) : (
+            <button
+              onClick={onSkip}
+              className="text-xs text-gray-400 hover:text-gray-600 underline transition-colors"
+            >
+              just check in, skip reflection
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -321,6 +483,8 @@ function GoalCard({
   onUndo,
   onEdit,
   onDelete,
+  onGraduate,
+  onSnoozeGraduation,
   loading,
   paused,
   dragHandleProps,
@@ -330,6 +494,8 @@ function GoalCard({
   onUndo: (id: string) => void;
   onEdit: (id: string) => void;
   onDelete: (id: string) => void;
+  onGraduate: (id: string) => void;
+  onSnoozeGraduation: (id: string) => void;
   loading: boolean;
   paused?: boolean;
   dragHandleProps?: React.HTMLAttributes<HTMLButtonElement> & { ref?: React.Ref<HTMLButtonElement> };
@@ -459,6 +625,34 @@ function GoalCard({
           <p className="text-xs text-gray-400 mt-1">
             {goal.completedThisPeriod}/{goal.targetCount} {label}
           </p>
+        </div>
+      )}
+
+      {goal.canGraduate && (
+        <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5">
+          <p className="text-xs text-amber-900">
+            <span className="mr-1.5" aria-hidden>🎓</span>
+            <span className="font-medium">{runText(goal)}</span>. Ready to graduate this one?
+          </p>
+          <p className="text-[11px] text-amber-700/80 mt-1">
+            It moves to your trophy shelf and stops being tracked - no check-ins, no nudges.
+          </p>
+          <div className="flex gap-3 mt-2">
+            <button
+              onClick={() => onGraduate(goal.id)}
+              disabled={loading}
+              className="text-xs font-medium text-amber-800 hover:text-amber-900 underline disabled:opacity-50"
+            >
+              graduate
+            </button>
+            <button
+              onClick={() => onSnoozeGraduation(goal.id)}
+              disabled={loading}
+              className="text-xs text-gray-400 hover:text-gray-600 underline disabled:opacity-50"
+            >
+              not yet
+            </button>
+          </div>
         </div>
       )}
 
@@ -621,7 +815,7 @@ export function HomePage({ userId }: { userId?: string }) {
 
   const handleCheckIn = (goalId: string) => {
     const goal = goals.find((g) => g.id === goalId);
-    if (!isGoalPaused(goalId) && goal?.lastPeriodMissed && goal.todayCount === 0) {
+    if (!isGoalPaused(goalId) && goal?.reflection && goal.todayCount === 0) {
       setReflectionTarget(goal);
       return;
     }
@@ -784,7 +978,13 @@ export function HomePage({ userId }: { userId?: string }) {
     }
   };
 
-  const sortedGoals = [...goals].sort((a, b) => (a.order ?? 999) - (b.order ?? 999));
+  // Graduated habits live on the trophy shelf, not in the tracked list, so every bit of the
+  // active UI below (ordering, drag-reorder, hide-completed, the all-done celebration) works
+  // off `sortedGoals` and never sees them.
+  const graduatedGoals = goals.filter((g) => g.graduatedAt);
+  const sortedGoals = goals
+    .filter((g) => !g.graduatedAt)
+    .sort((a, b) => (a.order ?? 999) - (b.order ?? 999));
 
   const handleDragEnd = async (event: DragEndEvent) => {
     const { active, over } = event;
@@ -808,7 +1008,24 @@ export function HomePage({ userId }: { userId?: string }) {
     }
   };
 
-  const allDone = goals.length > 0 && goals.every((g) => g.isDone);
+  const allDone = sortedGoals.length > 0 && sortedGoals.every((g) => g.isDone);
+
+  const postGraduation = async (goalId: string, graduation: "graduate" | "ungraduate" | "snooze") => {
+    setLoading(true);
+    try {
+      const res = await fetch(`/api/goals${q}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ goalId, graduation }),
+      });
+      if (!res.ok) throw new Error("Graduation update failed");
+      await fetchGoals();
+    } catch {
+      setError("Couldn't update that habit. Try again.");
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const updatedLabel = new Date(versionData.updatedAt + "T12:00:00").toLocaleDateString("en-US", {
     month: "short", day: "numeric",
@@ -845,7 +1062,7 @@ export function HomePage({ userId }: { userId?: string }) {
       {/* Vacation start form */}
       {vacationFormOpen && !vacation && !upcomingVacation && (
         <div className="mb-6 rounded-2xl border border-gray-200 bg-white shadow-sm p-4 space-y-3">
-          <p className="text-sm text-gray-700">Pause nudges and protect streaks for selected habits while you're away.</p>
+          <p className="text-sm text-gray-700">Pause nudges and protect streaks for selected habits while you’re away.</p>
           <div className="space-y-1.5 max-h-48 overflow-y-auto">
             {sortedGoals.map((g) => (
               <label key={g.id} className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
@@ -962,8 +1179,17 @@ export function HomePage({ userId }: { userId?: string }) {
         </div>
       )}
 
+      {/* Trophy shelf */}
+      {!initialLoad && graduatedGoals.length > 0 && (
+        <TrophyShelf
+          goals={graduatedGoals}
+          onUngraduate={(id) => postGraduation(id, "ungraduate")}
+          loading={loading}
+        />
+      )}
+
       {/* Goals */}
-      {!initialLoad && goals.some(isHandled) && (
+      {!initialLoad && sortedGoals.some(isHandled) && (
         <div className="flex justify-end mb-3">
           <button
             onClick={() => setHideDone((v) => !v)}
@@ -1000,6 +1226,8 @@ export function HomePage({ userId }: { userId?: string }) {
                     onUndo={handleUndo}
                     onEdit={setEditingId}
                     onDelete={handleDeleteHabit}
+                    onGraduate={(id) => postGraduation(id, "graduate")}
+                    onSnoozeGraduation={(id) => postGraduation(id, "snooze")}
                     loading={loading}
                     paused={isGoalPaused(goal.id)}
                   />
@@ -1026,12 +1254,13 @@ export function HomePage({ userId }: { userId?: string }) {
       )}
 
       {/* Reflection modal */}
-      {reflectionTarget && (
+      {reflectionTarget?.reflection && (
         <ReflectionModal
           goal={reflectionTarget}
+          prompt={reflectionTarget.reflection}
           onSubmit={handleReflectionSubmit}
           onSkip={handleReflectionSkip}
-          onClose={() => setReflectionTarget(null)}
+          onDismiss={() => setReflectionTarget(null)}
         />
       )}
 

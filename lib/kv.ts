@@ -5,7 +5,7 @@ const kv = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN!,
   cache: "no-store",
 });
-import type { Goal, GoalStatus, CheckInRecord, WeeklyNote, MoodEntry } from "./types";
+import type { Goal, GoalStatus, CheckInRecord, WeeklyNote, MoodEntry, ReflectionPrompt } from "./types";
 
 // Normalize the ?user= param: "alan" and empty both map to undefined (un-prefixed namespace).
 // Call this in every API route when reading the user query param.
@@ -165,13 +165,39 @@ export function getPstTimeHHMM(): string {
   return `${String(Number(hour) % 24).padStart(2, "0")}:${String(Number(minute)).padStart(2, "0")}`;
 }
 
+// ISO-8601 week key: weeks run Monday–Sunday, and week 1 is the one containing Jan 4. Note the
+// year is the *ISO* year, which can differ from the calendar year in late Dec / early Jan -
+// Mon Dec 29 2025 is "2026-W01", because it starts the week that contains Jan 4 2026.
+//
+// This must agree with getWeekDatesForDate (which weekly goals are scored over) and with
+// getWeekLabel (which renders a key back into "Week of <Monday>"). Both are already Monday-based
+// and anchored on Jan 4, so ISO is the convention that makes all three line up.
 export function getWeekKey(date?: string): string {
-  const d = date ? new Date(date + "T12:00:00") : new Date();
-  const pstDate = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Los_Angeles",
-  }).format(d);
-  const local = new Date(pstDate + "T12:00:00");
-  // ISO week number (Math.floor to avoid fractional days from T12:00:00)
+  const pstDate = date
+    ? date
+    : new Intl.DateTimeFormat("en-CA", { timeZone: "America/Los_Angeles" }).format(new Date());
+  const [y, m, d] = pstDate.split("-").map(Number);
+
+  // Step to the Thursday of this date's week: the ISO year/week are whichever ones own that
+  // Thursday, which is what makes the year-boundary cases fall out for free.
+  const thursday = new Date(Date.UTC(y, m - 1, d));
+  thursday.setUTCDate(thursday.getUTCDate() - ((thursday.getUTCDay() + 6) % 7) + 3);
+  const isoYear = thursday.getUTCFullYear();
+
+  // Thursday of ISO week 1 - the week containing Jan 4.
+  const week1Thursday = new Date(Date.UTC(isoYear, 0, 4));
+  week1Thursday.setUTCDate(week1Thursday.getUTCDate() - ((week1Thursday.getUTCDay() + 6) % 7) + 3);
+
+  const week = Math.round((thursday.getTime() - week1Thursday.getTime()) / (7 * 86400000)) + 1;
+  return `${isoYear}-W${String(week).padStart(2, "0")}`;
+}
+
+// The pre-ISO week numbering this app used until Aug 2026: weeks were phased off whatever
+// weekday Jan 4 landed on, so in 2026 they ran Sunday–Saturday and drifted a week out from the
+// Monday-based labels. Kept solely to read back the handful of weekly check-in keys written
+// while it was live - data written under a broken scheme still has to be read under it.
+function legacyWeekKey(dateStr: string): string {
+  const local = new Date(dateStr + "T12:00:00");
   const jan4 = new Date(local.getFullYear(), 0, 4);
   const daysDiff = Math.floor((local.getTime() - jan4.getTime()) / 86400000);
   const week = Math.ceil((daysDiff + jan4.getDay() + 1) / 7);
@@ -207,8 +233,8 @@ async function getWeeklyDaysCompleted(goalId: string, weekDates: string[], userI
   const fromDaily = counts.filter((c) => (c ?? 0) >= 1).length;
   if (fromDaily > 0) return fromDaily;
 
-  // Legacy fallback: weekly key stored before per-day tracking
-  const legacyKey = k(userId, `checkin:${goalId}:${getWeekKey(weekDates[0])}`);
+  // Legacy fallback: weekly key stored before per-day tracking, under the old week numbering.
+  const legacyKey = k(userId, `checkin:${goalId}:${legacyWeekKey(weekDates[0])}`);
   const legacy = await kv.get<number>(legacyKey);
   return (legacy ?? 0) >= 1 ? 1 : 0;
 }
@@ -301,11 +327,27 @@ export async function getGoalStatuses(userId?: string): Promise<GoalStatus[]> {
   const goals = await getGoals(userId);
   return Promise.all(
     goals.map(async (goal) => {
-      const [completed, streak, todayCount, lastPeriodMissed] = await Promise.all([
+      // A graduated habit isn't tracked any more, so there's nothing to recompute - its run was
+      // frozen the day it graduated. Reporting it as complete keeps every existing "is this
+      // outstanding?" check (nudges, done-filtering) answering "no" without needing to know
+      // about graduation at all.
+      if (isGraduated(goal)) {
+        return {
+          ...goal,
+          completedThisPeriod: goal.targetCount,
+          isDone: true,
+          streak: goal.graduatedRun ?? 0,
+          todayCount: 0,
+          reflection: null,
+          canGraduate: false,
+        };
+      }
+
+      const [completed, streak, todayCount, reflection] = await Promise.all([
         getCompletedThisPeriod(goal, userId),
         getStreak(goal, userId),
         getCheckInsForPeriod(goal.id, getTodayDate(), userId),
-        getLastPeriodMissed(goal, userId),
+        getReflectionPrompt(goal, userId),
       ]);
       return {
         ...goal,
@@ -313,7 +355,8 @@ export async function getGoalStatuses(userId?: string): Promise<GoalStatus[]> {
         isDone: completed >= goal.targetCount,
         streak,
         todayCount,
-        lastPeriodMissed,
+        reflection,
+        canGraduate: canGraduate(goal, streak),
       };
     })
   );
@@ -339,6 +382,10 @@ export async function addCheckIn(goalId: string, date?: string, userId?: string)
   const goals = await getGoals(userId);
   const goal = goals.find((g) => g.id === goalId);
   if (!goal) throw new Error("Goal not found");
+  // Graduated means untracked, so this is a real error rather than a no-op - the UI never
+  // offers the check-in, and the history grid's backfill cells stop at the graduation date.
+  // Anything still asking is out of date and should be told so.
+  if (isGraduated(goal)) throw new GraduatedGoalError(goalId);
 
   const targetDate = date || getTodayDate();
   const newCount = await kv.incr(k(userId, `checkin:${goalId}:${targetDate}`));
@@ -373,7 +420,7 @@ export async function getHistory(
   goal: Goal,
   periods: number,
   userId?: string
-): Promise<{ period: string; count: number; done: boolean; vacation: boolean }[]> {
+): Promise<{ period: string; count: number; done: boolean; vacation: boolean; graduated: boolean }[]> {
   const todayPST = getTodayDate();
   const [ty, tm, td] = todayPST.split("-").map(Number);
   const labels: string[] = [];
@@ -394,7 +441,15 @@ export async function getHistory(
   return labels.map((period, i) => {
     const count = counts[i] ?? 0;
     const done = goal.frequency === "daily" ? count >= goal.targetCount : count >= 1;
-    return { period, count, done, vacation: isVacationDay(period, vacationWindows, goal.id) };
+    return {
+      period,
+      count,
+      done,
+      vacation: isVacationDay(period, vacationWindows, goal.id),
+      // Days after graduation aren't misses - nothing was expected on them. The grid renders
+      // them as neutral and refuses to backfill them, the same way it treats vacation days.
+      graduated: !!goal.graduatedAt && period > goal.graduatedAt,
+    };
   });
 }
 
@@ -458,35 +513,160 @@ async function getWeeklyStreak(goal: Goal, userId?: string): Promise<number> {
   return streak;
 }
 
+// --- Graduation ---
+
+// How many consecutive periods at target before we offer to graduate a habit. A weekly habit's
+// period is a week, a daily habit's is a day - so this is 4 weeks either way, which is long
+// enough to mean something without being unreachable.
+const GRADUATION_PERIODS = 4;
+
+// How long "not yet" holds. Two weeks, not one: the user has just told us they still want to
+// work on this, and re-asking every few days turns an achievement into nagging.
+const GRADUATION_SNOOZE_DAYS = 14;
+
+// The run (in the units getStreak returns - days for daily, weeks for weekly) that makes a
+// habit eligible.
+function graduationThreshold(goal: Goal): number {
+  return goal.frequency === "daily" ? GRADUATION_PERIODS * 7 : GRADUATION_PERIODS;
+}
+
+export function isGraduated(goal: Goal): boolean {
+  return !!goal.graduatedAt;
+}
+
+// Thrown when something tries to check in a habit that has graduated. Its own type so the API
+// layer can answer 409 (your view of this habit is stale) rather than 500 (we broke).
+export class GraduatedGoalError extends Error {
+  constructor(goalId: string) {
+    super(`Goal "${goalId}" has graduated and is no longer tracked`);
+    this.name = "GraduatedGoalError";
+  }
+}
+
+// Whether to offer graduation, given a run we've already computed. Mood logging is excluded:
+// it's a journal, not a habit to master, so "you've got this one down" is meaningless for it.
+function canGraduate(goal: Goal, streak: number): boolean {
+  if (isGraduated(goal) || goal.type === "mood") return false;
+  if (streak < graduationThreshold(goal)) return false;
+  return !goal.graduationSnoozedUntil || goal.graduationSnoozedUntil <= getTodayDate();
+}
+
+// Freeze the habit's current run onto the goal and stop tracking it. The run is captured here,
+// at the one moment it's still computable - after this the check-ins stop, so recomputing it
+// later would only ever show it decaying.
+export async function graduateGoal(goalId: string, userId?: string): Promise<void> {
+  const goals = await getGoals(userId);
+  const goal = goals.find((g) => g.id === goalId);
+  if (!goal || isGraduated(goal)) return;
+
+  goal.graduatedAt = getTodayDate();
+  goal.graduatedRun = await getStreak(goal, userId);
+  delete goal.graduationSnoozedUntil;
+  await saveGoals(goals, userId);
+}
+
+// Put a graduated habit back into active tracking. The frozen run is dropped rather than
+// restored as a streak: the habit hasn't been tracked since it graduated, so its real current
+// streak is whatever the check-ins say, which is what getStreak will now go and work out.
+export async function ungraduateGoal(goalId: string, userId?: string): Promise<void> {
+  const goals = await getGoals(userId);
+  const goal = goals.find((g) => g.id === goalId);
+  if (!goal || !isGraduated(goal)) return;
+
+  delete goal.graduatedAt;
+  delete goal.graduatedRun;
+  // Don't immediately re-offer graduation to a habit the user just took back off the shelf.
+  goal.graduationSnoozedUntil = addDaysToDateStr(getTodayDate(), GRADUATION_SNOOZE_DAYS);
+  await saveGoals(goals, userId);
+}
+
+export async function snoozeGraduation(goalId: string, userId?: string): Promise<void> {
+  const goals = await getGoals(userId);
+  const goal = goals.find((g) => g.id === goalId);
+  if (!goal) return;
+  goal.graduationSnoozedUntil = addDaysToDateStr(getTodayDate(), GRADUATION_SNOOZE_DAYS);
+  await saveGoals(goals, userId);
+}
+
 // --- Missed period detection ---
 
-// Always returns yesterday's date regardless of goal frequency.
-// Reflection prompts are triggered based on missing yesterday, not missing a whole week.
-function getLastPeriodDateStr(): string {
-  const today = getTodayDate();
-  const [y, m, d] = today.split("-").map(Number);
-  const ref = new Date(Date.UTC(y, m - 1, d - 1, 12));
-  return [
-    ref.getUTCFullYear(),
-    String(ref.getUTCMonth() + 1).padStart(2, "0"),
-    String(ref.getUTCDate()).padStart(2, "0"),
-  ].join("-");
+function getYesterdayDateStr(): string {
+  return addDaysToDateStr(getTodayDate(), -1);
 }
 
-export function getLastPeriodKey(_goal: Goal): string {
-  return getLastPeriodDateStr();
+// The date a reflection is filed under. A daily goal's reflection is about the day it was
+// skipped (yesterday); a weekly goal's is about the week as a whole, so it's filed under the
+// day it was written.
+export function getReflectionDateKey(goal: Goal): string {
+  return goal.frequency === "daily" ? getYesterdayDateStr() : getTodayDate();
 }
 
-export async function getLastPeriodMissed(goal: Goal, userId?: string): Promise<boolean> {
+/**
+ * Whether to ask for a reflection before this goal's next check-in - and why.
+ *
+ * Daily goals: every day is expected, so a day with no check-in is a real miss.
+ *
+ * Weekly goals (e.g. 3x/week): a single skipped day is not a miss. The target is measured
+ * across the whole week, so skipping Tuesday with four days still open costs nothing and
+ * doesn't warrant a prompt. We only ask once the miss actually threatens the target:
+ *   - `week-behind` - the days still open this week no longer outnumber the days still
+ *     needed, so the target is either on a knife's edge (every remaining day must land) or
+ *     already out of reach.
+ *   - `week-missed` - last week closed below target. Caught on the first check-in of the new
+ *     week, which also caps this to once per week. Without it, a week that quietly ends short
+ *     would never be reflected on at all, since the user stops checking in before the
+ *     knife's-edge day arrives.
+ *
+ * Vacation-paused days are neither available nor expected: they're dropped from the days
+ * remaining, and the target is prorated down so a partly-paused week can't be "missed" for
+ * days the user was never asked to show up on.
+ *
+ * `required` marks the prompts the user can't wave away. A period that's already gone -
+ * yesterday, a closed-out week, a week whose target is now unreachable - can only be learned
+ * from, so writing something is the price of the next check-in. A knife's-edge week is still
+ * winnable and the user is checking in as we ask, so that one stays optional; charging them
+ * for good behavior is how a prompt turns into noise people click through.
+ */
+export async function getReflectionPrompt(goal: Goal, userId?: string): Promise<ReflectionPrompt | null> {
+  // A graduated habit has no expectations attached to it any more, so it can't be behind on one.
+  if (isGraduated(goal)) return null;
+
   const hasHistory = (await kv.llen(k(userId, `history:${goal.id}`))) > 0;
-  if (!hasHistory) return false;
+  if (!hasHistory) return null;
 
-  const yesterday = getLastPeriodDateStr();
   const vacationWindows = await getVacationWindows(userId);
-  if (isVacationDay(yesterday, vacationWindows, goal.id)) return false;
+  const paused = (date: string) => isVacationDay(date, vacationWindows, goal.id);
 
-  const count = await getCheckInsForPeriod(goal.id, yesterday, userId);
-  return count === 0;
+  if (goal.frequency === "daily") {
+    const yesterday = getYesterdayDateStr();
+    if (paused(yesterday)) return null;
+    const count = await getCheckInsForPeriod(goal.id, yesterday, userId);
+    return count === 0 ? { reason: "missed-day", date: yesterday, required: true } : null;
+  }
+
+  const today = getTodayDate();
+  const weekDates = getWeekDatesForDate(today);
+  const completed = await getWeeklyDaysCompleted(goal.id, weekDates, userId);
+  const target = Math.min(goal.targetCount, weekDates.filter((d) => !paused(d)).length);
+  const daysLeft = weekDates.filter((d) => d >= today && !paused(d)).length;
+  const needed = target - completed;
+  if (needed > 0 && needed >= daysLeft) {
+    // Still winnable if every remaining day lands; only forced once it can't be.
+    return { reason: "week-behind", completed, target, daysLeft, required: needed > daysLeft };
+  }
+
+  // Nothing logged yet this week, so this is the first check-in since last week closed out.
+  if (completed === 0) {
+    const lastWeekDates = getWeekDatesForDate(addDaysToDateStr(today, -7));
+    const lastTarget = Math.min(goal.targetCount, lastWeekDates.filter((d) => !paused(d)).length);
+    if (lastTarget === 0) return null;
+    const lastCompleted = await getWeeklyDaysCompleted(goal.id, lastWeekDates, userId);
+    if (lastCompleted < lastTarget) {
+      return { reason: "week-missed", completed: lastCompleted, target: lastTarget, required: true };
+    }
+  }
+
+  return null;
 }
 
 export async function getReflectionsForGoal(
@@ -512,7 +692,7 @@ export async function saveReflection(goalId: string, text: string, userId?: stri
   const goals = await getGoals(userId);
   const goal = goals.find((g) => g.id === goalId);
   if (!goal) return;
-  const periodKey = getLastPeriodKey(goal);
+  const periodKey = getReflectionDateKey(goal);
   await kv.set(k(userId, `reflection:${goalId}:${periodKey}`), { text, savedAt: Date.now() });
 }
 

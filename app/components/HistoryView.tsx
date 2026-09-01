@@ -14,6 +14,7 @@ interface HistoryEntry {
   count: number;
   done: boolean;
   vacation: boolean;
+  graduated: boolean; // day falls after the habit graduated, so nothing was expected on it
 }
 
 interface GoalHistory {
@@ -81,7 +82,7 @@ function BackfillModal({
         {reflection && (
           <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3">
             <p className="text-xs font-medium text-amber-600 uppercase tracking-wide mb-1">Your reflection</p>
-            <p className="text-sm text-gray-700 leading-snug">"{reflection}"</p>
+            <p className="text-sm text-gray-700 leading-snug">“{reflection}”</p>
           </div>
         )}
         <div className="space-y-1">
@@ -169,7 +170,8 @@ function DailyGrid({
                 }
                 const isFuture = entry.period > today;
                 const isToday = entry.period === today;
-                const isMissed = !isFuture && !isToday && !entry.done && !entry.vacation;
+                const isMissed =
+                  !isFuture && !isToday && !entry.done && !entry.vacation && !entry.graduated;
                 const reflection = isMissed ? reflections[entry.period] : undefined;
                 const color = isFuture
                   ? "bg-gray-100"
@@ -177,13 +179,27 @@ function DailyGrid({
                   ? "bg-green-500"
                   : entry.vacation
                   ? "bg-sky-200"
+                  : entry.graduated
+                  ? "bg-gray-100"
                   : reflection
                   ? "bg-amber-300"
                   : "bg-gray-200";
                 const label = new Date(entry.period + "T12:00:00").toLocaleDateString("en-US", {
                   weekday: "short", month: "short", day: "numeric",
                 });
-                const status = isFuture || frequency === "weekly" ? "" : entry.done ? ` · ✓` : entry.vacation ? ` · 🌴 vacation` : isToday ? "" : ` · ✗ missed`;
+                const status = isFuture
+                  ? ""
+                  : entry.graduated
+                  ? ` · 🎓 graduated`
+                  : frequency === "weekly"
+                  ? ""
+                  : entry.done
+                  ? ` · ✓`
+                  : entry.vacation
+                  ? ` · 🌴 vacation`
+                  : isToday
+                  ? ""
+                  : ` · ✗ missed`;
                 const retroHint = isMissed && onBackfill ? "\ntap to backfill" : "";
                 const tooltipText = reflection
                   ? `${label}${status}\n"${reflection.length > 80 ? reflection.slice(0, 80) + "…" : reflection}"${retroHint}`
@@ -211,6 +227,13 @@ function DailyGrid({
         <span>vacation</span>
         <div className="w-3 h-3 rounded-sm bg-green-500" />
         <span>done</span>
+        {/* Only worth a swatch on a grid that actually has graduated days in it. */}
+        {entries.some((e) => e.graduated) && (
+          <>
+            <div className="w-3 h-3 rounded-sm bg-gray-100 border border-gray-200" />
+            <span>graduated</span>
+          </>
+        )}
       </div>
     </div>
   );
@@ -235,7 +258,9 @@ function GoalHistoryCard({
   const { goal, entries, streak, reflections } = goalHistory;
   const today = getTodayPST();
   const doneCount = entries.filter((e) => e.done).length;
-  const totalPast = entries.filter((e) => e.period <= today).length;
+  // Days after graduation were never expected, so they'd only drag the completion rate down
+  // for a habit the user was told to stop tracking.
+  const totalPast = entries.filter((e) => e.period <= today && !e.graduated).length;
   const rate = totalPast > 0 ? Math.round((doneCount / totalPast) * 100) : 0;
 
   return (
@@ -243,7 +268,14 @@ function GoalHistoryCard({
       <div className="flex items-center gap-2 mb-4">
         <span className="text-2xl">{goal.emoji}</span>
         <div>
-          <h2 className="text-lg font-semibold text-gray-900">{goal.name}</h2>
+          <h2 className="text-lg font-semibold text-gray-900 flex items-center gap-1.5">
+            {goal.name}
+            {goal.graduatedAt && (
+              <span className="text-[10px] font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-full px-1.5 py-0.5">
+                🎓 graduated
+              </span>
+            )}
+          </h2>
           <p className="text-xs text-gray-400">{goal.targetCount}x {goal.frequency}</p>
         </div>
       </div>

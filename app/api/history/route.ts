@@ -9,9 +9,11 @@ export async function GET(req: Request) {
     const history = await Promise.all(
       goals.map(async (goal) => {
         const periods = 91;
+        // A graduated habit stopped being tracked, so recomputing its streak would just show it
+        // decaying toward zero. Report the run frozen at graduation instead.
         const [entries, streak] = await Promise.all([
           getHistory(goal, periods, user),
-          getStreak(goal, user),
+          goal.graduatedAt ? Promise.resolve(goal.graduatedRun ?? 0) : getStreak(goal, user),
         ]);
 
         // Reflections are now stored by date key for all goal types

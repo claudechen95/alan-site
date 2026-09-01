@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { addCheckIn, undoCheckIn, getGoals, resolveUser, getNtfyTopic } from "@/lib/kv";
+import { addCheckIn, undoCheckIn, getGoals, resolveUser, getNtfyTopic, GraduatedGoalError } from "@/lib/kv";
 
 async function sendNotification(goalId: string, userId?: string) {
   const topic = await getNtfyTopic(userId);
@@ -33,6 +33,10 @@ export async function POST(req: Request) {
     if (!date) sendNotification(goalId, user); // only notify for real-time check-ins
     return NextResponse.json(result);
   } catch (err) {
+    // The caller's view of this habit is stale, not broken - it graduated out of tracking.
+    if (err instanceof GraduatedGoalError) {
+      return NextResponse.json({ error: err.message }, { status: 409 });
+    }
     console.error(err);
     return NextResponse.json({ error: "Failed to check in" }, { status: 500 });
   }
