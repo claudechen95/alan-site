@@ -85,7 +85,7 @@ export function CoachPage({ userId }: { userId?: string }) {
       .then((data: CoachMessage[]) => setMessages(data))
       .catch(() => setMessages([]))
       .finally(() => setLoading(false));
-  }, []);
+  }, [q]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -236,6 +236,10 @@ export function CoachPage({ userId }: { userId?: string }) {
                 className="inline-flex items-center gap-1.5 rounded-full bg-white border border-gray-200 pl-2 pr-1 py-1 text-xs text-gray-600"
               >
                 {a.previewUrl ? (
+                  // A 16px chip for a base64 data URL the browser already holds in memory -
+                  // there's no network fetch to optimize, and next/image can't optimize a data
+                  // URL anyway (it would need unoptimized, i.e. this same <img> with more steps).
+                  // eslint-disable-next-line @next/next/no-img-element
                   <img src={a.previewUrl} alt="" className="w-4 h-4 rounded object-cover" />
                 ) : (
                   <span>{a.kind === "pdf" ? "📄" : "📎"}</span>

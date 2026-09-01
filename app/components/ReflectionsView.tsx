@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import type { JournalEntry } from "@/lib/kv";
 
 function formatTimestamp(ts: number): string {
@@ -39,7 +39,7 @@ function AddEntryModal({
           <h2 className="text-lg font-semibold text-gray-900">New reflection</h2>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-2xl leading-none">&times;</button>
         </div>
-        <p className="text-sm text-gray-500 mb-3">What's on your mind?</p>
+        <p className="text-sm text-gray-500 mb-3">What’s on your mind?</p>
         <textarea
           autoFocus
           value={text}
@@ -67,14 +67,14 @@ export function ReflectionsPage({ userId }: { userId?: string }) {
 
   const q = userId && userId !== "alan" ? `?user=${userId}` : "";
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
     const res = await fetch(`/api/journal${q}`);
     if (res.ok) setEntries(await res.json());
     setLoading(false);
-  };
+  }, [q]);
 
-  useEffect(() => { load(); }, [userId]);
+  useEffect(() => { load(); }, [load]);
 
   const handleSave = async (text: string) => {
     await fetch(`/api/journal${q}`, {

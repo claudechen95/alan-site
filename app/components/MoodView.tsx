@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import type { MoodEntry } from "@/lib/types";
 import { MoodModal } from "@/app/components/MoodModal";
 
@@ -53,15 +53,15 @@ export function MoodPage({ userId }: { userId?: string }) {
 
   const q = userId ? `&user=${encodeURIComponent(userId)}` : "";
 
-  const load = () => {
+  const load = useCallback(() => {
     fetch(`/api/mood?date=all${q}`)
       .then((r) => r.json())
       .then((data: MoodEntry[]) => setGroups(groupByDate(data)))
       .catch(() => setGroups([]))
       .finally(() => setLoading(false));
-  };
+  }, [q]);
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); }, [load]);
 
   const handleSubmit = async (emoji: string, text: string) => {
     setModalOpen(false);
