@@ -223,14 +223,21 @@ function HabitForm({
       )}
 
       {nudgeActive && (
-        <div className="flex items-center justify-between">
-          <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">Reminder time (PST)</p>
-          <input
-            type="time"
-            value={nudgeTime}
-            onChange={(e) => setNudgeTime(e.target.value)}
-            className="border border-gray-200 rounded-xl px-3 py-1.5 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-300"
-          />
+        <div>
+          <div className="flex items-center justify-between">
+            <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">First reminder (PST)</p>
+            <input
+              type="time"
+              value={nudgeTime}
+              onChange={(e) => setNudgeTime(e.target.value)}
+              // Past 9pm there's no room left to fit three reminders before the 10pm call.
+              max="21:00"
+              className="border border-gray-200 rounded-xl px-3 py-1.5 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-300"
+            />
+          </div>
+          <p className="text-xs text-gray-400 mt-1.5">
+            3 texts, spread from then until 10pm, then a call.
+          </p>
         </div>
       )}
 
@@ -502,6 +509,7 @@ function GoalCard({
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [nameExpanded, setNameExpanded] = useState(false);
+  const [gradInfoOpen, setGradInfoOpen] = useState(false);
   const doneCard = goal.isDone;
   const doneCircle = isHandled(goal);
   const label = goal.frequency === "daily" ? "today" : "this week";
@@ -628,35 +636,36 @@ function GoalCard({
         </div>
       )}
 
-      {goal.canGraduate && (
-        <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5">
-          <p className="text-xs text-amber-900">
-            <span className="mr-1.5" aria-hidden>🎓</span>
-            <span className="font-medium">{runText(goal)}</span>. Ready to graduate this one?
-          </p>
-          <p className="text-[11px] text-amber-700/80 mt-1">
-            It moves to your trophy shelf and stops being tracked - no check-ins, no nudges.
-          </p>
-          <div className="flex gap-3 mt-2">
+      {/* The offer sits inline with edit/delete rather than in a banner of its own. It's a
+          suggestion about a habit that's going *well*, so it shouldn't shout - and it appears on
+          every eligible card at once, which a full-width callout turns into a wall of amber. The
+          reasoning behind it moves behind the ⓘ, on demand. */}
+      <div className="flex items-center gap-3 mt-3 pt-2 border-t border-gray-100">
+        {goal.canGraduate && !confirmDelete && (
+          <div className="flex items-center gap-1 mr-auto">
             <button
               onClick={() => onGraduate(goal.id)}
               disabled={loading}
-              className="text-xs font-medium text-amber-800 hover:text-amber-900 underline disabled:opacity-50"
+              className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-700 hover:text-amber-900 disabled:opacity-50"
             >
-              graduate
+              <span aria-hidden>🎓</span>
+              <span className="underline">graduate</span>
             </button>
             <button
-              onClick={() => onSnoozeGraduation(goal.id)}
-              disabled={loading}
-              className="text-xs text-gray-400 hover:text-gray-600 underline disabled:opacity-50"
+              onClick={() => setGradInfoOpen((v) => !v)}
+              aria-label="What does graduating do?"
+              aria-expanded={gradInfoOpen}
+              className={`w-4 h-4 rounded-full border text-[10px] leading-none flex items-center justify-center transition-colors ${
+                gradInfoOpen
+                  ? "border-amber-400 bg-amber-100 text-amber-800"
+                  : "border-amber-300 text-amber-600 hover:bg-amber-50"
+              }`}
             >
-              not yet
+              ?
             </button>
           </div>
-        </div>
-      )}
-
-      <div className="flex justify-end gap-3 mt-3 pt-2 border-t border-gray-100">
+        )}
+        <div className={`flex gap-3 ${goal.canGraduate && !confirmDelete ? "" : "ml-auto"}`}>
         {confirmDelete ? (
           <>
             <span className="text-xs text-gray-500">Delete this habit?</span>
@@ -689,7 +698,25 @@ function GoalCard({
             </button>
           </>
         )}
+        </div>
       </div>
+
+      {goal.canGraduate && gradInfoOpen && !confirmDelete && (
+        <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+          <p className="text-[11px] leading-relaxed text-amber-900">
+            <span className="font-medium">{runText(goal)}</span> - long enough that this looks
+            automatic. Graduating moves it to your trophy shelf and stops tracking it: no
+            check-ins, no nudges, no reflection prompts. You can start tracking it again any time.
+          </p>
+          <button
+            onClick={() => onSnoozeGraduation(goal.id)}
+            disabled={loading}
+            className="mt-1.5 text-[11px] text-gray-400 hover:text-gray-600 underline disabled:opacity-50"
+          >
+            not yet - don&rsquo;t ask again for two weeks
+          </button>
+        </div>
+      )}
     </div>
   );
 }
