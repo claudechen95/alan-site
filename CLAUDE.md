@@ -66,7 +66,7 @@ Reflections: `reflection:{goalId}:{YYYY-MM-DD}` → `{ text, savedAt }`. Always 
 
 Mood entries: `mood:{YYYY-MM-DD}` → list of `MoodEntry` JSON strings. Also increments `checkin:emotional-checkin:{date}`.
 
-Weekly notes: `note:{YYYY-WXX}` → `WeeklyNote`. Seeded via `seedInitialWeeklyNote()`, `seedWeeklyNoteW22()`, etc., all called in the GET handler of `app/api/notes/route.ts` — only for Alan's namespace (`!user`). Other users start with empty notes.
+Weekly notes: `note:{YYYY-WXX}` → `WeeklyNote`, keyed by **ISO-8601 week** (Monday-start; week 1 contains Jan 4; the year is the ISO year, so Mon Dec 29 2025 is `2026-W01`). `getWeekKey` in `lib/kv.ts` is the only thing that should compute one - `NotesView`'s client-side `getWeekKeyForDate` mirrors it and must stay in step. Until Aug 2026 `getWeekKey` phased weeks off Jan 4's weekday instead, so in 2026 it returned Sunday–Saturday weeks numbered one below ISO: on Wed Aug 26 it produced `2026-W34`, the key already holding the note labelled "Week of Aug 17", so writing "this week" would have overwritten last week's note. Stored notes were unaffected (their keys and labels were already ISO-correct), so the fix was to `getWeekKey` alone with no data migration. `legacyWeekKey` preserves the old numbering solely to read the two pre-existing `checkin:gym:2026-W1x` keys via the legacy fallback in `getWeeklyDaysCompleted`. Seeded via `seedInitialWeeklyNote()`, `seedWeeklyNoteW22()`, etc., all called in the GET handler of `app/api/notes/route.ts` - only for Alan's namespace (`!user`). Other users start with empty notes.
 
 ## Goal schema
 ```ts
@@ -82,15 +82,35 @@ interface Goal {
   nudgeTime?: string;   // "HH:MM" PST; gates when a habit enters the text-nudge rotation
   nudgeEnabled?: boolean; // daily goals only; opt out of nudging, default true
   nudgeNumber?: number; // stable per-user 1..N id used in nudge texts ("reply 2")
+  graduatedAt?: string;   // YYYY-MM-DD; presence = graduated, i.e. no longer tracked at all
+  graduatedRun?: number;  // run frozen at graduation: days (daily) or weeks (weekly)
+  graduationSnoozedUntil?: string; // YYYY-MM-DD; "not yet" on the graduation offer
 }
 ```
 
 ## Key behaviors
 - **Goal ordering:** Drag-and-drop via `@dnd-kit`. Done goals always sink to bottom. Order persisted via `PATCH /api/goals` with `{ orderedIds: string[] }`.
-- **Reflection prompt:** Triggers when `lastPeriodMissed && completedThisPeriod === 0`. `lastPeriodMissed` = yesterday had 0 check-ins, for ALL goal types (not weekly-boundary based).
+- **Reflection prompt:** `getReflectionPrompt()` in `lib/kv.ts` is the single source of truth for whether to ask, why, and whether the user can decline.
+  It returns a `ReflectionPrompt` (`lib/types.ts`) on `GoalStatus.reflection`, or `null` for "don't ask"; the client also requires `todayCount === 0`, so a goal prompts at most once a day.
+  Daily goals prompt when yesterday had no check-in (`missed-day`).
+  Weekly goals are judged against the whole week, not a single day: a 3x/week habit skipped on Tuesday with four days still open is not behind and is not asked anything.
+  They prompt only when the days still open no longer outnumber the days still needed (`week-behind`), or when nothing is logged yet this week and last week closed below target (`week-missed`, capped at once per week).
+  Vacation-paused days are dropped from the days remaining and prorate the target down, so a partly-paused week can't be "missed" for days the user was never expected to show up.
+- **Required vs optional reflections:** `ReflectionPrompt.required` decides whether the reflection can be waved away.
+  A period that's already lost - yesterday, a closed-out week, a week whose target is now unreachable - is `required`; a knife's-edge week that's still winnable is not.
+  A required prompt drops the "just check in, skip reflection" link and needs `MIN_REFLECTION_CHARS` (15) before the check-in button enables.
+  It still closes via ✕ or backdrop, but closing does **not** check the habit in - that's the whole point, since the old skip link handed over the check-in for one tap.
+  This is UX friction, not enforcement: `POST /api/checkins` has no server-side gate (no auth, personal app), and backfilling past days from the history grid can still raise a week's count.
 - **Emotional Check-in** (`id: "emotional-checkin"`, `type: "mood"`): Opens mood emoji picker. "Log another" instead of "undo" when done. No position pin — user controls via drag.
 - **Backfill:** Click a missed (gray/amber) cell in the history grid to log it for that date. `POST /api/checkins` accepts `{ goalId, date }`.
 - **Weekly streak for weekly goals:** Counted in weeks, not days. `getWeeklyStreak()` walks back 52 weeks.
+- **Graduation:** A habit the user has decided is automatic. `Goal.graduatedAt` (a `YYYY-MM-DD`) is the flag - its presence *is* "graduated", and `graduatedRun` freezes the run it had earned at that moment.
+  Graduating **stops tracking entirely**: no check-ins (`addCheckIn` throws `GraduatedGoalError`, which `POST /api/checkins` turns into a 409), no text nudges (`getPendingNudges` filters them out), no reflection prompts (`getReflectionPrompt` returns `null`), and no streak recomputation - `getGoalStatuses` short-circuits to the frozen values instead of hitting Redis, and `app/api/history` reports `graduatedRun` rather than a streak that would only decay.
+  The habit leaves the tracked list for a collapsible trophy shelf of emoji medallions at the top of the home screen (`TrophyShelf` in `HabitTracker.tsx`); "start tracking again" on a medallion is the only way back, since there is no automatic un-graduation.
+  `getReflectionPrompt` and `getGoalStatuses` both key off `isGraduated()`, so that helper is the single definition.
+  **Suggesting it:** `GoalStatus.canGraduate` drives an in-card offer once the run reaches `GRADUATION_PERIODS` (4) consecutive periods at target - 28 days for a daily habit, 4 weeks for a weekly one. Mood goals are never eligible (a journal isn't a habit to master). "not yet" sets `graduationSnoozedUntil` 14 days out; un-graduating sets it too, so a habit just taken off the shelf isn't immediately re-offered.
+  All three actions go through `PATCH /api/goals` with `{ goalId, graduation: "graduate" | "ungraduate" | "snooze" }` (the same PATCH also still handles `{ orderedIds }` for drag-reorder).
+  Post-graduation days in the history grid are neutral, not misses: `getHistory` marks them `graduated: true`, which drops them from the completion-rate denominator and blocks backfill. `nudgeNumber` is deliberately *not* renumbered on graduation, so a habit's reply number survives a round trip to the shelf and back.
 - **Vacation mode:** Per-user, per-habit pause (`VacationWindow { startDate, endDate, goalIds }` in `lib/kv.ts`, key `settings:vacation`). Can be scheduled for a future `startDate`, not just started immediately — `getActiveVacation` only returns a window once `startDate <= today`, so a scheduled-but-not-started window pauses nothing yet; `getUpcomingVacation` surfaces it for display before then. `endVacationNow` trims an active window to end yesterday (preserving vacation-day history) or, for a not-yet-started window, deletes it outright since nothing happened yet to preserve. `startVacation` always replaces any window that hasn't fully ended (active or upcoming) — only one vacation window is tracked "in flight" at a time.
 
 ## Coach chat (digital twin)
@@ -134,10 +154,10 @@ const note = {
   weekLabel: 'Week of Jun 22',
   headline: 'Short headline here',
   notes: 'Prose summary of the meeting.',
-  changes: [
-    '🔑 Key point one',
-    '🔑 Key point two',
-  ],
+  // The progress log is retired - new notes leave this empty. NoteCard still renders it for
+  // notes written before the removal, and NoteForm passes the old lines through on edit so
+  // editing an old note doesn't blank its log.
+  changes: [],
   updatedAt: new Date().toISOString(),
 };
 process.stdout.write(JSON.stringify(note));
@@ -159,8 +179,23 @@ The curl command is all that's needed — no seed functions, no code changes req
 ```bash
 npm run dev        # localhost:3000
 npm run deploy     # Vercel deploy via scripts/deploy.sh
+npm run verify     # lint + typecheck + test — run this before pushing
+npm test           # vitest run
+npm run test:watch # vitest in watch mode
 ```
 Env vars needed: `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` (in `.env.local`).
+
+## Tests
+
+Vitest, in `test/`. `.github/workflows/ci.yml` runs lint → typecheck → test → build on every push to `main` and every PR.
+
+**No live Redis.** `test/setup.ts` mocks `@upstash/redis` so every `new Redis(...)` returns the shared in-memory `FakeRedis` from `test/redis-fake.ts`. That fake implements exactly the command surface `lib/kv.ts` uses and preserves the Upstash semantics `kv.ts` depends on (`mget` returns `null` for missing keys, lists are newest-first via `lpush`). Add a command to `kv.ts` and the fake needs it too — better a loud failure than a silent `undefined`.
+
+**Time is pinned.** The data-layer suites `vi.setSystemTime` to Wed 26 Aug 2026. That date is deliberate: a Wednesday leaves 5 days in the week, which is the only way to construct both the "still winnable" and "already out of reach" weekly-goal cases. Never write a test that depends on the day it happens to run — an earlier throwaway script did, and its "out of reach" case was unconstructible on Mondays, so it failed every Monday for no real reason.
+
+Suites: `week-keys` (ISO week numbering, incl. a 400-day sweep across both year boundaries and a guard pinning already-stored note keys to their labels), `reflection` (every branch of `getReflectionPrompt`), `graduation` (eligibility, freeze/restore, the untracked guarantees), `nudges` (the pure `getPendingNudges` predicate).
+
+`scripts/seed-reflection-demo.mts` is *not* a test — it seeds a disposable `reflectdemo` user against live Redis for manual browser QA of the modals and trophy shelf, which unit tests can't cover. `npx tsx --env-file=.env.local scripts/seed-reflection-demo.mts [clean]`.
 
 ## Goals currently tracked (as of June 2026)
 

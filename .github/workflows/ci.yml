@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run lint
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      # Catches anything that only breaks in a production build (bad imports, server/client
+      # boundary mistakes) rather than at type-check time. The Upstash env vars are absent here
+      # on purpose: the clients are constructed lazily, so a build that needs them at module
+      # load is itself the bug this step should catch.
+      - run: npm run build
