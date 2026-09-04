@@ -247,6 +247,22 @@ export async function isCallReached(userId: string | undefined, date: string): P
   return !!(await kv.get(k(userId, `nudge:call-reached:${date}`)));
 }
 
+// Set by the inbound webhook on *any* reply, and it stops the whole ladder for the day - the
+// remaining texts, the calls, and the partner alert. This is a deliberately weak bar: a bare
+// "ok" clears it. Answering the text is treated as answering the phone, on the view that the
+// nudge's job is to reach a person and a reply proves it did.
+export async function markReplied(
+  userId: string | undefined,
+  date: string,
+  atHHMM: string
+): Promise<void> {
+  await kv.set(k(userId, `nudge:replied:${date}`), atHHMM, { ex: secondsUntilMidnightPST() });
+}
+
+export async function hasReplied(userId: string | undefined, date: string): Promise<boolean> {
+  return !!(await kv.get(k(userId, `nudge:replied:${date}`)));
+}
+
 // Claims the one "your partner didn't finish" text per user per day. Deliberately separate from
 // the call claim: the call and the alert fire on different ticks, so one key can't gate both.
 export async function claimPartnerAlert(userId: string | undefined, date: string): Promise<boolean> {

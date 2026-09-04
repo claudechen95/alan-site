@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import {
   findUserByPhone,
   setNudgeSnoozed,
+  markReplied,
   getGoalStatuses,
   getActiveVacation,
   getTodayDate,
@@ -58,16 +59,23 @@ export async function POST(req: Request) {
       const goals = (await getGoalStatuses(uid)).filter((g) => !pausedIds.has(g.id));
       const pending = getPendingNudges(goals, todayDow, getPstTimeHHMM());
 
+      const reply: string = body.content.trim().toLowerCase();
+
+      // Answering the text ends the day's ladder outright, whatever the answer says. The bar is
+      // intentionally low - "ok" clears it - on the view that the escalation exists to reach a
+      // person, and a reply is proof it did. Set before the habit matching below, because it
+      // applies to every reply and not just the ones that name something.
+      if (reply.length > 0) await markReplied(uid, today, getPstTimeHHMM());
+
       // Sendblue has no reply-to/thread field, so there's no reliable way to know which
       // outbound message a reply is "about" — match the reply text against pending habit
       // names, or a number against each goal's stable nudgeNumber (assigned/renumbered in
       // lib/kv.ts whenever a habit is added or removed, so "2" always means the same habit
-      // rather than a position in whichever list happened to go out last). Snoozing must be
-      // an intentional act: a number or a habit's name snoozes just that one; only an
-      // explicit "stop"/"all"-type reply snoozes everything. A reply matching none of that
-      // (a stray "ok", "on it", etc.) snoozes nothing — the nudge keeps firing, since silence
-      // shouldn't be this easy to win.
-      const reply: string = body.content.trim().toLowerCase();
+      // rather than a position in whichever list happened to go out last).
+      //
+      // Since markReplied already silences the whole day, this per-habit matching no longer
+      // changes what gets sent — it survives only to name the habits back in the confirmation,
+      // so a reply of "2" is echoed as the habit it meant rather than as a bare acknowledgement.
       const numbers = (reply.match(/\d+/g) ?? []).map(Number);
       const numberMatches = pending.filter((g) => g.nudgeNumber != null && numbers.includes(g.nudgeNumber)).map((g) => g.id);
       const nameMatches = pending.filter((g) => matchesHabit(reply, g.name)).map((g) => g.id);
@@ -78,14 +86,22 @@ export async function POST(req: Request) {
 
       if (toSnoozeIds.length > 0) {
         await Promise.all(toSnoozeIds.map((id) => setNudgeSnoozed(uid, id, today)));
+      }
 
-        // Confirm back so the reply doesn't just vanish into silence — the user has no other
-        // way to know it was understood (or understood correctly).
-        const snoozedNames = pending.filter((g) => toSnoozeIds.includes(g.id)).map((g) => `${g.emoji} ${g.name}`);
+      // Confirm back so the reply doesn't just vanish into silence — the user has no other way
+      // to know it was understood. The message has to state the *whole* effect: naming one
+      // habit still ends the day for all of them, so "Snoozed for today: Gym" on its own would
+      // read as if the others were still live.
+      if (reply.length > 0) {
+        const named = pending.filter((g) => toSnoozeIds.includes(g.id)).map((g) => `${g.emoji} ${g.name}`);
+        const body_ =
+          named.length > 0
+            ? `✅ Got it: ${named.join(", ")}. Nudges are off for the rest of today.`
+            : `✅ Got it. Nudges are off for the rest of today.`;
         try {
-          await sendText(body.number, `✅ Snoozed for today: ${snoozedNames.join(", ")}`);
+          await sendText(body.number, body_);
         } catch (err) {
-          console.error(`Nudge snooze confirmation failed for ${user.id}:`, err);
+          console.error(`Nudge reply confirmation failed for ${user.id}:`, err);
         }
       }
     }

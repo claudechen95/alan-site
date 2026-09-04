@@ -224,6 +224,30 @@ describe("snoozing", () => {
   });
 });
 
+// Answering the text is treated exactly like answering the phone: the escalation's job was to
+// reach a person, and a reply proves it did. Deliberately a much weaker bar than a snooze -
+// "ok" clears it - and unlike a snooze it does silence the partner alert too.
+describe("replying to a text", () => {
+  it("ends the whole day - no more texts, no call, no partner", async () => {
+    const log: string[] = [];
+    for (let m = toMin("08:00"); m <= toMin("23:00"); m += 10) {
+      const at = fmt(m);
+      // Replying just after the first text lands.
+      if (at === "18:10") fakeRedis.seed(`tester:nudge:replied:${TODAY}`, "18:05");
+      const seen = { t: texts.length, c: calls.length };
+      await tickAt(at);
+      for (const t of texts.slice(seen.t)) log.push(`${at} text→${t.to}`);
+      for (const c of calls.slice(seen.c)) log.push(`${at} call→${c.to}`);
+    }
+    expect(log).toEqual([`18:00 text→${PHONE}`]);
+  });
+
+  it("silences the ladder even when the reply arrives before any nudge went out", async () => {
+    fakeRedis.seed(`tester:nudge:replied:${TODAY}`, "09:00");
+    expect(await runDay()).toEqual([]);
+  });
+});
+
 describe("per-habit scheduling", () => {
   it("gives every habit its own three texts regardless of when it starts", async () => {
     fakeRedis.seed("tester:goals", [

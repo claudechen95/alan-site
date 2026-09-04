@@ -13,6 +13,7 @@ import {
   getCallAttempts,
   markCallReached,
   isCallReached,
+  hasReplied,
   getTodayDate,
   getPstTimeHHMM,
   resolveUser,
@@ -56,6 +57,10 @@ export async function POST(req: Request) {
     const uid = resolveUser(user.id);
 
     try {
+      // Any reply at all ends the day - see markReplied. Checked before anything else is read,
+      // since it short-circuits every remaining step rather than just one of them.
+      if (await hasReplied(uid, today)) continue;
+
       const vacation = await getActiveVacation(uid);
       const pausedIds = new Set(vacation?.goalIds ?? []);
       const goals = (await getGoalStatuses(uid)).filter((g) => !pausedIds.has(g.id));
