@@ -180,6 +180,73 @@ export async function getEscalationTime(userId: string | undefined, date: string
   return await kv.get<string>(k(userId, `nudge:escalated:${date}`));
 }
 
+// One record per call attempt (step 4 rings up to MAX_CALL_ATTEMPTS times). `sid` is filled in
+// after Twilio accepts the call, so a later tick can ask what became of it; it's absent when the
+// claim succeeded but the send then failed.
+export interface CallAttempt {
+  at: string; // HH:MM PST the attempt went out
+  sid?: string;
+}
+
+// Claims attempt number `attempt` before dialling, the same before-not-after discipline as
+// claimNudgeSlot: two overlapping dispatch runs must not both ring the phone.
+export async function claimCallAttempt(
+  userId: string | undefined,
+  date: string,
+  attempt: number,
+  atHHMM: string
+): Promise<boolean> {
+  const result = await kv.set(k(userId, `nudge:call:${date}:${attempt}`), { at: atHHMM }, {
+    nx: true,
+    ex: secondsUntilMidnightPST(),
+  });
+  return result !== null;
+}
+
+// Safe to overwrite without nx: only the tick that won the claim above ever gets here.
+export async function recordCallSid(
+  userId: string | undefined,
+  date: string,
+  attempt: number,
+  atHHMM: string,
+  sid: string
+): Promise<void> {
+  await kv.set(k(userId, `nudge:call:${date}:${attempt}`), { at: atHHMM, sid }, {
+    ex: secondsUntilMidnightPST(),
+  });
+}
+
+// The day's attempts so far, oldest first. Reads the whole fixed-size range in one round trip
+// and stops at the first gap, so the array length is the attempt count.
+export async function getCallAttempts(
+  userId: string | undefined,
+  date: string,
+  maxAttempts: number
+): Promise<CallAttempt[]> {
+  const keys = Array.from({ length: maxAttempts }, (_, i) => k(userId, `nudge:call:${date}:${i}`));
+  const raw = await kv.mget<CallAttempt[]>(...keys);
+  const attempts: CallAttempt[] = [];
+  for (const entry of raw) {
+    if (!entry) break;
+    attempts.push(entry);
+  }
+  return attempts;
+}
+
+// Set once a person actually picks up. Unlike a snooze this does end the ladder outright,
+// partner alert included - answering is a live acknowledgement, not a mute button.
+export async function markCallReached(
+  userId: string | undefined,
+  date: string,
+  atHHMM: string
+): Promise<void> {
+  await kv.set(k(userId, `nudge:call-reached:${date}`), atHHMM, { ex: secondsUntilMidnightPST() });
+}
+
+export async function isCallReached(userId: string | undefined, date: string): Promise<boolean> {
+  return !!(await kv.get(k(userId, `nudge:call-reached:${date}`)));
+}
+
 // Claims the one "your partner didn't finish" text per user per day. Deliberately separate from
 // the call claim: the call and the alert fire on different ticks, so one key can't gate both.
 export async function claimPartnerAlert(userId: string | undefined, date: string): Promise<boolean> {

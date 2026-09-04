@@ -27,14 +27,29 @@ function escapeXml(text: string): string {
   return text.replace(/[<>&"']/g, (c) => XML_ESCAPES[c]);
 }
 
-export async function placeCall(to: string, spokenMessage: string): Promise<void> {
+function authHeader(): string {
+  const sid = process.env.TWILIO_ACCOUNT_SID!;
+  return `Basic ${Buffer.from(`${sid}:${process.env.TWILIO_AUTH_TOKEN!}`).toString("base64")}`;
+}
+
+// How long the phone rings before Twilio gives up. Deliberately shorter than Twilio's 60s
+// default and shorter than the ~25-30s most carriers wait before diverting to voicemail: a call
+// that rings out returns an honest `no-answer`, whereas one that reaches voicemail returns
+// `completed` and is indistinguishable from a human answering (see getCallOutcome).
+const RING_TIMEOUT_SEC = 20;
+
+/** Returns the Twilio call SID, which getCallOutcome needs on a later tick to decide on a retry. */
+export async function placeCall(to: string, spokenMessage: string): Promise<string> {
   const sid = process.env.TWILIO_ACCOUNT_SID!;
   // Inline TwiML rather than a hosted callback URL: the call is one-way, so there's nothing for
-  // Twilio to POST back to and no public webhook to authenticate.
-  // The leading pause keeps the first word from being clipped by the connect, and loop=2 repeats
-  // the message once, since a single pass is easy to miss on pickup.
+  // Twilio to POST back to and no public webhook to authenticate. loop=2 repeats the message
+  // once, since a single pass is easy to miss on pickup.
+  //
+  // No leading <Pause>: answering-machine detection already withholds the TwiML until it has
+  // classified the callee, so the first word can't be clipped by the connect, and a pause on top
+  // of that delay is just silence the user waits through.
   const twiml =
-    `<Response><Pause length="1"/>` +
+    `<Response>` +
     `<Say voice="Polly.Matthew" loop="2">${escapeXml(spokenMessage)}</Say>` +
     `</Response>`;
 
@@ -42,15 +57,50 @@ export async function placeCall(to: string, spokenMessage: string): Promise<void
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
-      Authorization: `Basic ${Buffer.from(`${sid}:${process.env.TWILIO_AUTH_TOKEN!}`).toString("base64")}`,
+      Authorization: authHeader(),
     },
     body: new URLSearchParams({
       To: to,
       From: process.env.TWILIO_FROM_NUMBER!,
       Twiml: twiml,
+      Timeout: String(RING_TIMEOUT_SEC),
+      // Without this, the retry loop cannot work at all: Twilio reports a call answered by
+      // voicemail as `completed`, exactly like one answered by a person, so declining a call in
+      // a meeting would look like a pickup and stop the ladder. AnsweredBy is the only field
+      // that separates the two.
+      MachineDetection: "Enable",
     }),
   });
   if (!res.ok) {
     throw new Error(`Twilio call failed: ${res.status} ${await res.text()}`);
   }
+  return ((await res.json()) as { sid: string }).sid;
+}
+
+// What a placed call turned out to be, from the perspective of "do we call again?".
+//   reached  - a person picked up; the ladder has done its job
+//   missed   - rang out, was declined, hit voicemail, or failed; worth another attempt
+//   pending  - still queued/ringing/talking; ask again on the next tick
+export type CallOutcome = "reached" | "missed" | "pending";
+
+export async function getCallOutcome(callSid: string): Promise<CallOutcome> {
+  const sid = process.env.TWILIO_ACCOUNT_SID!;
+  const res = await fetch(`${TWILIO_API}/${sid}/Calls/${callSid}.json`, {
+    headers: { Authorization: authHeader() },
+  });
+  if (!res.ok) {
+    throw new Error(`Twilio call lookup failed: ${res.status} ${await res.text()}`);
+  }
+  const call = (await res.json()) as { status: string; answered_by?: string | null };
+
+  if (["queued", "initiated", "ringing", "in-progress"].includes(call.status)) return "pending";
+  // busy / no-answer / failed / canceled never connected to anything.
+  if (call.status !== "completed") return "missed";
+
+  // `completed` only means something answered. `unknown` is counted as a person on purpose:
+  // detection failing is not evidence of a machine, and ringing someone three times because
+  // Twilio couldn't classify them is the worse error.
+  return call.answered_by === "human" || call.answered_by === "unknown" || !call.answered_by
+    ? "reached"
+    : "missed";
 }

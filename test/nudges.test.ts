@@ -5,7 +5,9 @@ import {
   dueSlotIndices,
   callScript,
   addMinutes,
+  nextCallTime,
   DAY_END,
+  MAX_CALL_ATTEMPTS,
 } from "@/lib/nudges";
 import type { GoalStatus } from "@/lib/types";
 
@@ -150,5 +152,30 @@ describe("callScript", () => {
     const script = callScript("Alan", ["Gym session", "Salad", "7+ hr sleep"]);
     expect(script).toContain("3 habits open today: Gym session, Salad, and 7+ hr sleep.");
     expect(script).toContain("check them off");
+  });
+});
+
+// Call attempts are scheduled off the previous attempt rather than off a fixed timetable, which
+// is the opposite of dueSlotIndices and deliberate: a missed text slot is a reminder lost and
+// replaying it late would crowd the call it's meant to precede, whereas a missed call attempt is
+// a chance to reach someone that's still worth taking a tick late.
+describe("nextCallTime", () => {
+  it("puts the first call on DAY_END", () => {
+    expect(nextCallTime(0, null)).toBe(DAY_END);
+  });
+
+  it("spaces retries by the backoff, measured from the last call", () => {
+    expect(nextCallTime(1, "22:00")).toBe("22:10");
+    expect(nextCallTime(2, "22:10")).toBe("22:20");
+  });
+
+  it("returns null once the attempts are spent, which is what hands over to the partner", () => {
+    expect(nextCallTime(MAX_CALL_ATTEMPTS, "22:20")).toBeNull();
+  });
+
+  it("delays rather than skips when dispatch was down for the scheduled attempt", () => {
+    // Back after an outage: the second call goes out 10 minutes after the first actually
+    // happened, not at the time it would have had the day run uninterrupted.
+    expect(nextCallTime(1, "22:40")).toBe("22:50");
   });
 });

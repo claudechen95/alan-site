@@ -8,6 +8,11 @@ import {
   claimEscalation,
   getEscalationTime,
   claimPartnerAlert,
+  claimCallAttempt,
+  recordCallSid,
+  getCallAttempts,
+  markCallReached,
+  isCallReached,
   getTodayDate,
   getPstTimeHHMM,
   resolveUser,
@@ -18,13 +23,15 @@ import {
   dueSlotIndices,
   callScript,
   addMinutes,
+  nextCallTime,
   DAY_END,
+  MAX_CALL_ATTEMPTS,
   PARTNER_ALERT_DELAY_MIN,
 } from "@/lib/nudges";
 import { sendText } from "@/lib/sendblue";
-import { isCallConfigured, placeCall } from "@/lib/call";
+import { isCallConfigured, placeCall, getCallOutcome } from "@/lib/call";
 
-type Step = "text" | "call" | "partner";
+type Step = "text" | "call" | "reached" | "partner";
 
 // Triggered every 10 minutes, 8am–11pm PST, by an external cron-job.org schedule (see CLAUDE.md).
 // Secured with a plain shared secret rather than a signing scheme since the caller is a plain HTTP
@@ -57,31 +64,56 @@ export async function POST(req: Request) {
       const pendingAll = getPendingNudges(goals, todayDow, nowHHMM);
       if (pendingAll.length === 0) continue;
 
-      // Step 5, checked first because it's the one step a snooze can't dodge. Replying "stop"
-      // silences your own phone; only actually finishing the habit keeps it from your partner.
-      const escalatedAt = await getEscalationTime(uid, today);
-      if (escalatedAt && nowHHMM >= addMinutes(escalatedAt, PARTNER_ALERT_DELAY_MIN)) {
-        if (user.partnerPhone && (await claimPartnerAlert(uid, today))) {
-          const names = pendingAll.map((g) => `${g.emoji} ${g.name}`).join(", ");
-          await sendText(user.partnerPhone, `📢 ${user.label} didn't finish today: ${names}`);
-          results.push({ userId: user.id, step: "partner" });
-        }
-        continue;
-      }
-
       const snoozedFlags = await Promise.all(pendingAll.map((g) => getNudgeSnoozed(uid, g.id, today)));
       const pending = pendingAll.filter((_, i) => !snoozedFlags[i]);
       const snoozed = pendingAll.filter((_, i) => snoozedFlags[i]);
 
-      // Step 4. Every habit's text slots land before DAY_END, so past this point there is
-      // nothing left to text: it's the call or nothing. The escalation is claimed off pendingAll
-      // (so a fully-snoozed evening still starts the partner countdown) but only rings a phone
-      // if something survived the snooze filter.
+      // Steps 4 and 5. Every habit's text slots land before DAY_END, so past this point there is
+      // nothing left to text: it's the call, then the partner, or nothing.
       if (nowHHMM >= DAY_END) {
-        if (await claimEscalation(uid, today, nowHHMM)) {
-          if (pending.length > 0 && isCallConfigured()) {
-            await placeCall(user.phone, callScript(user.label, pending.map((g) => g.name)));
+        // A pickup ends the day outright - see markCallReached.
+        if (await isCallReached(uid, today)) continue;
+
+        // Claimed off pendingAll, not `pending`, so a fully-snoozed evening still starts the
+        // countdown that step 5 hangs off even though no call will be placed.
+        await claimEscalation(uid, today, nowHHMM);
+
+        const callable = pending.length > 0 && isCallConfigured();
+        const attempts = callable ? await getCallAttempts(uid, today, MAX_CALL_ATTEMPTS) : [];
+        const last = attempts[attempts.length - 1];
+
+        // Resolve the previous attempt before starting another, so "keep calling" is driven by
+        // what actually happened rather than by the clock alone.
+        if (last?.sid) {
+          const outcome = await getCallOutcome(last.sid);
+          if (outcome === "pending") continue; // still ringing; decide on the next tick
+          if (outcome === "reached") {
+            await markCallReached(uid, today, nowHHMM);
+            results.push({ userId: user.id, step: "reached" });
+            continue;
+          }
+        }
+
+        const nextAt = callable ? nextCallTime(attempts.length, last?.at ?? null) : null;
+        if (nextAt && nowHHMM >= nextAt) {
+          if (await claimCallAttempt(uid, today, attempts.length, nowHHMM)) {
+            const sid = await placeCall(user.phone, callScript(user.label, pending.map((g) => g.name)));
+            await recordCallSid(uid, today, attempts.length, nowHHMM, sid);
             results.push({ userId: user.id, step: "call" });
+          }
+          continue;
+        }
+        if (nextAt) continue; // attempts remain, just not due yet
+
+        // Step 5: the calls are spent (or were never possible). The countdown runs from the last
+        // attempt, falling back to the escalation time when nothing could be dialled at all.
+        const base = last?.at ?? (await getEscalationTime(uid, today));
+        if (base && nowHHMM >= addMinutes(base, PARTNER_ALERT_DELAY_MIN)) {
+          if (user.partnerPhone && (await claimPartnerAlert(uid, today))) {
+            // Reported off pendingAll: snoozing mutes your own phone, never your partner's.
+            const names = pendingAll.map((g) => `${g.emoji} ${g.name}`).join(", ");
+            await sendText(user.partnerPhone, `📢 ${user.label} didn't finish today: ${names}`);
+            results.push({ userId: user.id, step: "partner" });
           }
         }
         continue;

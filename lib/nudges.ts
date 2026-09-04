@@ -16,8 +16,28 @@ export const DAY_END = "22:00";
 
 export const NUDGE_TEXT_COUNT = 3;
 
-// How long after the call the user has to finish before their partner is told.
+// Step 4 is up to this many calls, not one: a single ring is easy to decline in a meeting, and
+// declining is precisely the case the call exists for.
+export const MAX_CALL_ATTEMPTS = 3;
+
+// The gap between call attempts. Retries have to land on cron ticks to happen at all, so this is
+// quantised to the 10-minute tick rate - a shorter backoff would simply round up to it, and a
+// longer one would push the last attempt and the partner alert past the dispatch window's close.
+export const CALL_RETRY_MIN = 10;
+
+// How long after the ladder's last call the user has to finish before their partner is told.
 export const PARTNER_ALERT_DELAY_MIN = 30;
+
+// When the next call attempt is due, or null once the attempts are spent. Measured from when the
+// previous call actually went out rather than from a fixed timetable, so a dispatch outage delays
+// the ladder instead of silently burning the attempts it slept through - the opposite of
+// dueSlotIndices, because a text slot missed is a reminder lost, while a call attempt missed is
+// a chance to reach someone that's still worth taking late.
+export function nextCallTime(attemptsMade: number, lastCallAt: string | null): string | null {
+  if (attemptsMade >= MAX_CALL_ATTEMPTS) return null;
+  if (attemptsMade === 0 || !lastCallAt) return DAY_END;
+  return addMinutes(lastCallAt, CALL_RETRY_MIN);
+}
 
 function toMinutes(hhmm: string): number {
   const [h, m] = hhmm.split(":").map(Number);

@@ -12,9 +12,13 @@ import type { Goal } from "@/lib/types";
 // rather than a time argument threaded in. That's the only way this exercises the same
 // getPstTimeHHMM/getTodayDate path production runs on.
 
-const { texts, calls } = vi.hoisted(() => ({
+const { texts, calls, phone } = vi.hoisted(() => ({
   texts: [] as { to: string; body: string }[],
   calls: [] as { to: string; script: string }[],
+  // Stands in for the person being called. `outcome` is what Twilio would report about the last
+  // attempt, which is the only thing that decides whether the ladder rings again - so these
+  // tests set it to drive the retry loop rather than mocking Twilio's HTTP shape.
+  phone: { outcome: "missed" as "reached" | "missed" | "pending" },
 }));
 
 vi.mock("@/lib/sendblue", () => ({
@@ -27,7 +31,9 @@ vi.mock("@/lib/call", () => ({
   isCallConfigured: () => true,
   placeCall: async (to: string, script: string) => {
     calls.push({ to, script });
+    return `CA${calls.length}`;
   },
+  getCallOutcome: async () => phone.outcome,
 }));
 
 const TODAY = "2026-08-26"; // Wednesday, PDT (UTC-7)
@@ -97,24 +103,26 @@ beforeEach(() => {
   fakeRedis.reset();
   texts.length = 0;
   calls.length = 0;
+  phone.outcome = "missed";
   seedUser();
   fakeRedis.seed("tester:goals", [salad]);
 });
 
 describe("the nudge ladder over a full day", () => {
-  it("sends three texts, then calls, then tells the partner", async () => {
+  it("sends three texts, calls three times, then tells the partner", async () => {
     expect(await runDay()).toEqual([
       `18:00 text→${PHONE}`,
       `19:20 text→${PHONE}`,
       `20:40 text→${PHONE}`,
       `22:00 call→${PHONE}`,
-      `22:30 text→${PARTNER}`,
+      `22:10 call→${PHONE}`,
+      `22:20 call→${PHONE}`,
+      `22:50 text→${PARTNER}`,
     ]);
   });
 
   it("says the habit out loud on the call", async () => {
     await runDay();
-    expect(calls).toHaveLength(1);
     expect(calls[0].script).toBe(
       "Hey Tester. This is your accountability check. You still have 1 habit open today: Salad. Open the app to check it off."
     );
@@ -125,20 +133,78 @@ describe("the nudge ladder over a full day", () => {
     expect(await runDay()).toEqual([]);
   });
 
-  it("stops at the call when there's no partner to escalate to", async () => {
+  it("stops at the calls when there's no partner to escalate to", async () => {
     seedUser({ partnerPhone: undefined });
     expect(await runDay()).toEqual([
       `18:00 text→${PHONE}`,
       `19:20 text→${PHONE}`,
       `20:40 text→${PHONE}`,
       `22:00 call→${PHONE}`,
+      `22:10 call→${PHONE}`,
+      `22:20 call→${PHONE}`,
     ]);
+  });
+});
+
+// The reason step 4 retries at all: one ring is trivially declined, and being in a meeting is
+// exactly when the call matters. Twilio reports a voicemail pickup as `completed`, identical to
+// a human answering, so lib/call.ts leans on answering-machine detection to tell them apart -
+// getCallOutcome collapses that to reached/missed/pending and this is what the route does with it.
+describe("calling until someone picks up", () => {
+  it("gives up after three attempts and hands over to the partner", async () => {
+    const log = await runDay();
+    expect(log.filter((l) => l.includes("call"))).toEqual([
+      `22:00 call→${PHONE}`,
+      `22:10 call→${PHONE}`,
+      `22:20 call→${PHONE}`,
+    ]);
+  });
+
+  it("stops calling once a person answers, and lets them off the partner alert", async () => {
+    const log: string[] = [];
+    for (let m = toMin("22:00"); m <= toMin("23:00"); m += 10) {
+      const at = fmt(m);
+      // The first call connects; every tick after that sees a reached call.
+      if (at === "22:10") phone.outcome = "reached";
+      const seen = { t: texts.length, c: calls.length };
+      await tickAt(at);
+      for (const t of texts.slice(seen.t)) log.push(`${at} text→${t.to}`);
+      for (const c of calls.slice(seen.c)) log.push(`${at} call→${c.to}`);
+    }
+    // One call, and crucially no partner text - answering is a live acknowledgement, unlike a
+    // snooze, so it ends the day.
+    expect(log).toEqual([`22:00 call→${PHONE}`]);
+  });
+
+  it("waits rather than redialling while the previous call is still ringing", async () => {
+    phone.outcome = "pending";
+    await tickAt("22:00");
+    await tickAt("22:10");
+    await tickAt("22:20");
+    expect(calls).toHaveLength(1);
+
+    // Once it resolves as missed, the ladder picks up where it left off instead of having
+    // burned the attempts it spent waiting.
+    phone.outcome = "missed";
+    await tickAt("22:30");
+    await tickAt("22:40");
+    expect(calls).toHaveLength(3);
+  });
+
+  it("delays the partner alert to 30 min after the last call, not the first", async () => {
+    const log = await runDay();
+    expect(log).toContain(`22:20 call→${PHONE}`);
+    expect(log).toContain(`22:50 text→${PARTNER}`);
+    expect(log).not.toContain(`22:30 text→${PARTNER}`);
   });
 });
 
 describe("snoozing", () => {
   // The whole point of the design: a snooze is a mute button on your own phone, not an exit
   // from the accountability. Only finishing the habit stops step 5.
+  // With everything snoozed no call is placed at all, so there's no last-attempt time to hang
+  // the countdown off - it falls back to the escalation time, and the partner still hears at
+  // DAY_END + 30 exactly as before retries existed.
   it("silences your own phone but still tells your partner", async () => {
     fakeRedis.seed(`tester:nudge:snoozed:salad:${TODAY}`, 1);
     expect(await runDay()).toEqual([`22:30 text→${PARTNER}`]);
@@ -180,7 +246,9 @@ describe("per-habit scheduling", () => {
       `21:20 text→${PHONE}`,
       `21:40 text→${PHONE}`,
       `22:00 call→${PHONE}`,
-      `22:30 text→${PARTNER}`,
+      `22:10 call→${PHONE}`,
+      `22:20 call→${PHONE}`,
+      `22:50 text→${PARTNER}`,
     ]);
   });
 });
@@ -192,10 +260,16 @@ describe("idempotence", () => {
     for (let i = 0; i < 10; i++) await tickAt("18:00");
     expect(texts).toHaveLength(1);
 
+    // Each call attempt is claimed before dialling, so a replayed tick can't ring twice - and
+    // the backoff keeps the next attempt from being pulled forward into the same minute.
     for (let i = 0; i < 10; i++) await tickAt("22:00");
     expect(calls).toHaveLength(1);
+    for (let i = 0; i < 10; i++) await tickAt("22:10");
+    expect(calls).toHaveLength(2);
+    for (let i = 0; i < 10; i++) await tickAt("22:20");
+    expect(calls).toHaveLength(3);
 
-    for (let i = 0; i < 10; i++) await tickAt("22:30");
+    for (let i = 0; i < 10; i++) await tickAt("22:50");
     expect(texts.filter((t) => t.to === PARTNER)).toHaveLength(1);
   });
 
