@@ -114,10 +114,10 @@ describe("the nudge ladder over a full day", () => {
       `18:00 text→${PHONE}`,
       `19:20 text→${PHONE}`,
       `20:40 text→${PHONE}`,
-      `22:00 call→${PHONE}`,
-      `22:10 call→${PHONE}`,
-      `22:20 call→${PHONE}`,
-      `22:50 text→${PARTNER}`,
+      `20:50 call→${PHONE}`,
+      `21:00 call→${PHONE}`,
+      `21:10 call→${PHONE}`,
+      `21:40 text→${PARTNER}`,
     ]);
   });
 
@@ -139,9 +139,9 @@ describe("the nudge ladder over a full day", () => {
       `18:00 text→${PHONE}`,
       `19:20 text→${PHONE}`,
       `20:40 text→${PHONE}`,
-      `22:00 call→${PHONE}`,
-      `22:10 call→${PHONE}`,
-      `22:20 call→${PHONE}`,
+      `20:50 call→${PHONE}`,
+      `21:00 call→${PHONE}`,
+      `21:10 call→${PHONE}`,
     ]);
   });
 });
@@ -154,9 +154,9 @@ describe("calling until someone picks up", () => {
   it("gives up after three attempts and hands over to the partner", async () => {
     const log = await runDay();
     expect(log.filter((l) => l.includes("call"))).toEqual([
-      `22:00 call→${PHONE}`,
-      `22:10 call→${PHONE}`,
-      `22:20 call→${PHONE}`,
+      `20:50 call→${PHONE}`,
+      `21:00 call→${PHONE}`,
+      `21:10 call→${PHONE}`,
     ]);
   });
 
@@ -193,9 +193,10 @@ describe("calling until someone picks up", () => {
 
   it("delays the partner alert to 30 min after the last call, not the first", async () => {
     const log = await runDay();
-    expect(log).toContain(`22:20 call→${PHONE}`);
-    expect(log).toContain(`22:50 text→${PARTNER}`);
-    expect(log).not.toContain(`22:30 text→${PARTNER}`);
+    expect(log).toContain(`21:10 call→${PHONE}`);
+    expect(log).toContain(`21:40 text→${PARTNER}`);
+    // 30 min after the *first* attempt would have been 21:20.
+    expect(log).not.toContain(`21:20 text→${PARTNER}`);
   });
 });
 
@@ -207,7 +208,7 @@ describe("snoozing", () => {
   // DAY_END + 30 exactly as before retries existed.
   it("silences your own phone but still tells your partner", async () => {
     fakeRedis.seed(`tester:nudge:snoozed:salad:${TODAY}`, 1);
-    expect(await runDay()).toEqual([`22:30 text→${PARTNER}`]);
+    expect(await runDay()).toEqual([`21:20 text→${PARTNER}`]);
   });
 
   it("snoozing mid-evening drops the remaining texts and the call", async () => {
@@ -220,7 +221,7 @@ describe("snoozing", () => {
       for (const t of texts.slice(seen.t)) log.push(`${at} text→${t.to}`);
       for (const c of calls.slice(seen.c)) log.push(`${at} call→${c.to}`);
     }
-    expect(log).toEqual([`18:00 text→${PHONE}`, `22:30 text→${PARTNER}`]);
+    expect(log).toEqual([`18:00 text→${PHONE}`, `21:20 text→${PARTNER}`]);
   });
 });
 
@@ -259,7 +260,7 @@ describe("per-habit scheduling", () => {
     // the 18:00-ish window without either losing a reminder, and both land in one call.
     expect(log.filter((l) => l.includes(`text→${PHONE}`))).toHaveLength(6);
     expect(log).toContain(`09:00 text→${PHONE}`);
-    expect(log).toContain(`22:00 call→${PHONE}`);
+    expect(log).toContain(`20:50 call→${PHONE}`);
     expect(calls[0].script).toContain("2 habits open today: Salad, and Gym");
   });
 
@@ -269,10 +270,10 @@ describe("per-habit scheduling", () => {
       `21:00 text→${PHONE}`,
       `21:20 text→${PHONE}`,
       `21:40 text→${PHONE}`,
+      `21:50 call→${PHONE}`,
       `22:00 call→${PHONE}`,
       `22:10 call→${PHONE}`,
-      `22:20 call→${PHONE}`,
-      `22:50 text→${PARTNER}`,
+      `22:40 text→${PARTNER}`,
     ]);
   });
 });

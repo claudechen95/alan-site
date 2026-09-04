@@ -10,9 +10,16 @@ import type { GoalStatus } from "./types";
 
 export const DEFAULT_NUDGE_TIME = "21:00";
 
-// The moment the texting phase ends and the call goes out. Every habit's third text lands
-// before this and the call lands on it, so escalation timing doesn't depend on tick rate.
+// The latest the call phase may begin, and the boundary nudgeSlots divides the texting span
+// toward. Normally the call starts earlier than this - see callStartTime - but with three
+// attempts and a partner alert hanging off it, starting any later would run past the dispatch
+// window before the ladder finished.
 export const DAY_END = "22:00";
+
+// How long after the day's last text before the phone rings. One cron tick: long enough that a
+// text can be acted on first, short enough that the escalation still reads as a consequence of
+// that text rather than an unrelated event later in the evening.
+export const ESCALATION_DELAY_MIN = 10;
 
 export const NUDGE_TEXT_COUNT = 3;
 
@@ -33,9 +40,13 @@ export const PARTNER_ALERT_DELAY_MIN = 30;
 // the ladder instead of silently burning the attempts it slept through - the opposite of
 // dueSlotIndices, because a text slot missed is a reminder lost, while a call attempt missed is
 // a chance to reach someone that's still worth taking late.
-export function nextCallTime(attemptsMade: number, lastCallAt: string | null): string | null {
+export function nextCallTime(
+  attemptsMade: number,
+  lastCallAt: string | null,
+  callStart: string
+): string | null {
   if (attemptsMade >= MAX_CALL_ATTEMPTS) return null;
-  if (attemptsMade === 0 || !lastCallAt) return DAY_END;
+  if (attemptsMade === 0 || !lastCallAt) return callStart;
   return addMinutes(lastCallAt, CALL_RETRY_MIN);
 }
 
@@ -91,18 +102,17 @@ export function callScript(label: string, habitNames: string[]): string {
   );
 }
 
-// The single source of truth for "is this habit still pending" - the text dispatch, the call,
-// the partner alert, and the inbound reply matcher all run off it, so they can't disagree.
-export function getPendingNudges(goals: GoalStatus[], todayDow: number, nowHHMM: string): GoalStatus[] {
+// Everything that will nudge at some point today, whether or not its time has come yet. Split
+// out from getPendingNudges because the call has to be scheduled against habits that haven't
+// started nudging: an afternoon habit whose three texts finish at 19:40 must not drag the phone
+// call forward to 19:50 and spend all three attempts before the 21:00 habits have sent a single
+// reminder.
+export function getNudgeEligible(goals: GoalStatus[], todayDow: number): GoalStatus[] {
   return goals.filter((g) => {
     // Graduated habits aren't tracked any more, so they're never pending. (getGoalStatuses
     // already reports them as complete, which would exclude them anyway - this is the explicit
     // statement of why, so the reason survives any change to how a graduated status is shaped.)
     if (g.graduatedAt) return false;
-
-    // A habit doesn't enter the ladder until its configured reminder time has passed for the
-    // day - that time is also its first text slot (see nudgeSlots).
-    if ((g.nudgeTime ?? DEFAULT_NUDGE_TIME) > nowHHMM) return false;
 
     if (g.frequency === "daily") {
       return g.nudgeEnabled !== false && g.completedThisPeriod < g.targetCount;
@@ -112,4 +122,36 @@ export function getPendingNudges(goals: GoalStatus[], todayDow: number, nowHHMM:
     }
     return false;
   });
+}
+
+// The single source of truth for "is this habit still pending" - the text dispatch, the call,
+// the partner alert, and the inbound reply matcher all run off it, so they can't disagree. It's
+// the eligible set gated on the clock: a habit doesn't enter the ladder until its configured
+// reminder time has passed, which is also its first text slot (see nudgeSlots).
+export function getPendingNudges(goals: GoalStatus[], todayDow: number, nowHHMM: string): GoalStatus[] {
+  return getNudgeEligible(goals, todayDow).filter(
+    (g) => (g.nudgeTime ?? DEFAULT_NUDGE_TIME) <= nowHHMM
+  );
+}
+
+// When the first call goes out: one tick after the last of the day's habits has sent its third
+// text, so a text always gets a chance to be acted on before the phone rings. Computed over the
+// *eligible* set rather than the pending one, so the ladder waits for habits that haven't
+// started nudging yet.
+//
+// Habits configured at or past DAY_END are excluded from the maximum: nudgeSlots can't divide a
+// span that has already closed, so they get a single text rather than three and would otherwise
+// drag the whole escalation to the cap. The cap itself keeps the ladder inside the dispatch
+// window - with retries and the partner alert hanging off it, a later start would run out of
+// ticks before finishing.
+export function callStartTime(eligible: GoalStatus[]): string {
+  const thirdTexts = eligible
+    .map((g) => nudgeSlots(g.nudgeTime))
+    .filter((slots) => slots.length === NUDGE_TEXT_COUNT)
+    .map((slots) => slots[slots.length - 1]);
+
+  if (thirdTexts.length === 0) return DAY_END;
+  const last = thirdTexts.reduce((a, b) => (b > a ? b : a));
+  const start = addMinutes(last, ESCALATION_DELAY_MIN);
+  return start > DAY_END ? DAY_END : start;
 }

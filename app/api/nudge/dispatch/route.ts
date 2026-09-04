@@ -20,12 +20,13 @@ import {
 } from "@/lib/kv";
 import {
   getPendingNudges,
+  getNudgeEligible,
+  callStartTime,
   nudgeSlots,
   dueSlotIndices,
   callScript,
   addMinutes,
   nextCallTime,
-  DAY_END,
   MAX_CALL_ATTEMPTS,
   PARTNER_ALERT_DELAY_MIN,
 } from "@/lib/nudges";
@@ -65,7 +66,12 @@ export async function POST(req: Request) {
       const pausedIds = new Set(vacation?.goalIds ?? []);
       const goals = (await getGoalStatuses(uid)).filter((g) => !pausedIds.has(g.id));
 
-      // Snoozing is applied per step below, never here: steps 1–4 respect it, step 5 doesn't.
+      // The call is scheduled off everything that will nudge today, not just what's nudging
+      // right now, so an afternoon habit can't pull the escalation forward past the evening
+      // ones - see callStartTime.
+      const eligible = getNudgeEligible(goals, todayDow);
+      const callStart = callStartTime(eligible);
+
       const pendingAll = getPendingNudges(goals, todayDow, nowHHMM);
       if (pendingAll.length === 0) continue;
 
@@ -73,9 +79,9 @@ export async function POST(req: Request) {
       const pending = pendingAll.filter((_, i) => !snoozedFlags[i]);
       const snoozed = pendingAll.filter((_, i) => snoozedFlags[i]);
 
-      // Steps 4 and 5. Every habit's text slots land before DAY_END, so past this point there is
-      // nothing left to text: it's the call, then the partner, or nothing.
-      if (nowHHMM >= DAY_END) {
+      // Steps 4 and 5. Every habit's third text has landed by callStart, so past this point
+      // there is nothing left to text: it's the call, then the partner, or nothing.
+      if (nowHHMM >= callStart) {
         // A pickup ends the day outright - see markCallReached.
         if (await isCallReached(uid, today)) continue;
 
@@ -99,7 +105,7 @@ export async function POST(req: Request) {
           }
         }
 
-        const nextAt = callable ? nextCallTime(attempts.length, last?.at ?? null) : null;
+        const nextAt = callable ? nextCallTime(attempts.length, last?.at ?? null, callStart) : null;
         if (nextAt && nowHHMM >= nextAt) {
           if (await claimCallAttempt(uid, today, attempts.length, nowHHMM)) {
             const sid = await placeCall(user.phone, callScript(user.label, pending.map((g) => g.name)));

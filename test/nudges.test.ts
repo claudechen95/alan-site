@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   getPendingNudges,
+  getNudgeEligible,
+  callStartTime,
   nudgeSlots,
   dueSlotIndices,
   callScript,
@@ -160,22 +162,74 @@ describe("callScript", () => {
 // replaying it late would crowd the call it's meant to precede, whereas a missed call attempt is
 // a chance to reach someone that's still worth taking a tick late.
 describe("nextCallTime", () => {
-  it("puts the first call on DAY_END", () => {
-    expect(nextCallTime(0, null)).toBe(DAY_END);
+  it("puts the first call on the computed start rather than a fixed hour", () => {
+    expect(nextCallTime(0, null, "21:50")).toBe("21:50");
   });
 
   it("spaces retries by the backoff, measured from the last call", () => {
-    expect(nextCallTime(1, "22:00")).toBe("22:10");
-    expect(nextCallTime(2, "22:10")).toBe("22:20");
+    expect(nextCallTime(1, "21:50", "21:50")).toBe("22:00");
+    expect(nextCallTime(2, "22:00", "21:50")).toBe("22:10");
   });
 
   it("returns null once the attempts are spent, which is what hands over to the partner", () => {
-    expect(nextCallTime(MAX_CALL_ATTEMPTS, "22:20")).toBeNull();
+    expect(nextCallTime(MAX_CALL_ATTEMPTS, "22:10", "21:50")).toBeNull();
   });
 
   it("delays rather than skips when dispatch was down for the scheduled attempt", () => {
     // Back after an outage: the second call goes out 10 minutes after the first actually
     // happened, not at the time it would have had the day run uninterrupted.
-    expect(nextCallTime(1, "22:40")).toBe("22:50");
+    expect(nextCallTime(1, "22:40", "21:50")).toBe("22:50");
+  });
+});
+
+// The call is meant to read as the consequence of the third text going unanswered, so it's
+// scheduled off that text rather than off the wall clock.
+describe("callStartTime", () => {
+  const habit = (nudgeTime: string) => status({ id: nudgeTime, nudgeTime });
+
+  it("fires one tick after a habit's third text", () => {
+    // 21:00 habit texts at 21:00 / 21:20 / 21:40.
+    expect(callStartTime([habit("21:00")])).toBe("21:50");
+  });
+
+  it("waits for the latest habit, so an early one can't pull the call forward", () => {
+    // The 13:25 habit is done texting at 19:08, but calling then would spend all three attempts
+    // before the 21:00 habit had sent a single reminder.
+    expect(callStartTime([habit("13:25"), habit("21:00")])).toBe("21:50");
+  });
+
+  it("never starts later than DAY_END, which keeps the ladder inside the dispatch window", () => {
+    // A 21:30 habit's third text lands at 21:50, and 22:00 rather than 22:00+ is the start.
+    expect(callStartTime([habit("21:30")])).toBe(DAY_END);
+  });
+
+  it("ignores habits configured past DAY_END, which never get three texts at all", () => {
+    // A 22:30 habit gets one text, not three, so it has no third text to escalate from - it
+    // must not drag every other habit's call out to the cap.
+    expect(callStartTime([habit("21:00"), habit("22:30")])).toBe("21:50");
+  });
+
+  it("falls back to DAY_END when nothing has a full text schedule", () => {
+    expect(callStartTime([habit("22:30")])).toBe(DAY_END);
+    expect(callStartTime([])).toBe(DAY_END);
+  });
+});
+
+// getPendingNudges is getNudgeEligible gated on the clock; the split exists so the call can be
+// scheduled against habits that haven't started nudging yet.
+describe("getNudgeEligible", () => {
+  it("includes a habit whose nudge time hasn't arrived, unlike getPendingNudges", () => {
+    const goals = [status({ id: "late", nudgeTime: "21:00" })];
+    expect(getNudgeEligible(goals, 3).map((g) => g.id)).toEqual(["late"]);
+    expect(getPendingNudges(goals, 3, "18:00")).toEqual([]);
+    expect(getPendingNudges(goals, 3, "21:00").map((g) => g.id)).toEqual(["late"]);
+  });
+
+  it("still excludes graduated and completed habits", () => {
+    const goals = [
+      status({ id: "graduated", nudgeTime: "21:00", graduatedAt: "2026-08-01" }),
+      status({ id: "done", nudgeTime: "21:00", completedThisPeriod: 1, targetCount: 1 }),
+    ];
+    expect(getNudgeEligible(goals, 3)).toEqual([]);
   });
 });

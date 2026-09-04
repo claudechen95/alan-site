@@ -56,16 +56,20 @@ This is load-bearing for inbound replies only: Sendblue and Twilio both parse lo
 | Step | When | What |
 |------|------|------|
 | 1-3 | `nudgeTime`, then evenly spread to `DAY_END` | Text via Sendblue |
-| 4 | `DAY_END` (22:00 PST), retried every `CALL_RETRY_MIN` (10 min) up to `MAX_CALL_ATTEMPTS` (3) | Phone call via Twilio |
+| 4 | `callStartTime` — `ESCALATION_DELAY_MIN` (10 min) after the day's *last* third text, capped at `DAY_END` — then retried every `CALL_RETRY_MIN` (10 min) up to `MAX_CALL_ATTEMPTS` (3) | Phone call via Twilio |
 | 5 | `PARTNER_ALERT_DELAY_MIN` (30 min) after the *last* call attempt | Text to the user's `partnerPhone` |
 
-So an unanswered day runs 22:00, 22:10, 22:20, then the partner at 22:50.
+**The call is the third text's consequence, not a fixed hour.** For the usual all-21:00 evening that's texts at 21:00/21:20/21:40, calls at 21:50/22:00/22:10, partner at 22:40.
+
+`callStartTime` runs over `getNudgeEligible` (everything that will nudge today) rather than `getPendingNudges` (what's nudging *now*), and that distinction is load-bearing: an afternoon habit finishing its texts at 19:40 would otherwise start calling at 19:50 and spend all three attempts before the 21:00 habits had sent a single reminder.
+Habits whose `nudgeTime` is at or past `DAY_END` are excluded from the maximum, since `nudgeSlots` can't divide a closed span and gives them one text rather than three — without that, Piano Session at 22:30 would drag every other habit's call out to the cap.
+The `DAY_END` cap exists because three attempts and a partner alert hang off the start, so a later one would run past the dispatch window before finishing.
 
 The times come from the *habit*, not from the cron tick: `nudgeSlots(nudgeTime)` divides the span from `nudgeTime` to `DAY_END` into thirds, so a habit always gets exactly three texts before the call.
 Set to 9am they land 4h20m apart (9:00, 13:20, 17:40); set to 9pm they land 20 minutes apart (21:00, 21:20, 21:40).
 `nudgeTime` defaults to `"21:00"` and the habit form caps it at 21:00, since past that there's no span left to divide.
-`getPendingNudges` is the single source of truth for "is this goal pending", and gates a habit out of the ladder entirely until its `nudgeTime` has passed.
-Vacation-paused goals (`getActiveVacation`) and graduated goals are excluded.
+`getPendingNudges` is the single source of truth for "is this goal pending" — it's `getNudgeEligible` gated on the clock, so a habit stays out of the ladder until its `nudgeTime` has passed.
+Vacation-paused goals (`getActiveVacation`) and graduated goals are excluded from both.
 
 **Any reply ends the day.** `markReplied` sets `nudge:replied:{date}` on *any* non-empty inbound text, and the dispatch route checks it before reading anything else, so the remaining texts, all call attempts, and the partner alert are all skipped.
 The bar is deliberately low - "ok" clears it - on the principle that the escalation exists to reach a person and a reply proves it did, which is the same reason answering the phone (`nudge:call-reached:{date}`, set by `markCallReached`) also ends the ladder.
@@ -223,10 +227,10 @@ Vitest, in `test/`. `.github/workflows/ci.yml` runs lint → typecheck → test 
 
 **Time is pinned.** The data-layer suites `vi.setSystemTime` to Wed 26 Aug 2026. That date is deliberate: a Wednesday leaves 5 days in the week, which is the only way to construct both the "still winnable" and "already out of reach" weekly-goal cases. Never write a test that depends on the day it happens to run — an earlier throwaway script did, and its "out of reach" case was unconstructible on Mondays, so it failed every Monday for no real reason.
 
-Suites: `week-keys` (ISO week numbering, incl. a 400-day sweep across both year boundaries and a guard pinning already-stored note keys to their labels), `reflection` (every branch of `getReflectionPrompt`), `graduation` (eligibility, freeze/restore, the untracked guarantees), `nudges` (the pure `getPendingNudges` predicate, plus the escalation schedule: `nudgeSlots`, `dueSlotIndices`, `addMinutes`, `nextCallTime`, `callScript`), `phone` (E.164 canonicalization, incl. the legacy-format inbound match), `nudge-ladder` (the dispatch route end to end), `nudge-inbound` (the Sendblue reply webhook).
+Suites: `week-keys` (ISO week numbering, incl. a 400-day sweep across both year boundaries and a guard pinning already-stored note keys to their labels), `reflection` (every branch of `getReflectionPrompt`), `graduation` (eligibility, freeze/restore, the untracked guarantees), `nudges` (the pure `getPendingNudges`/`getNudgeEligible` predicates, plus the escalation schedule: `nudgeSlots`, `dueSlotIndices`, `addMinutes`, `callStartTime`, `nextCallTime`, `callScript`), `phone` (E.164 canonicalization, incl. the legacy-format inbound match), `nudge-ladder` (the dispatch route end to end), `nudge-inbound` (the Sendblue reply webhook).
 
 `nudge-ladder` is the one suite that drives an API route rather than the data layer.
-It replays a whole PST day at the real cron cadence (a POST every 10 simulated minutes, 8am–11pm) with Sendblue and Twilio mocked, and asserts the exact transcript of what went out and when — `18:00 text`, `19:20 text`, `20:40 text`, `22:00 call`, `22:10 call`, `22:20 call`, `22:50 partner text`.
+It replays a whole PST day at the real cron cadence (a POST every 10 simulated minutes, 8am–11pm) with Sendblue and Twilio mocked, and asserts the exact transcript of what went out and when — for its 18:00 habit, `18:00 text`, `19:20 text`, `20:40 text`, `20:50 call`, `21:00 call`, `21:10 call`, `21:40 partner text`.
 The clock is the input under test, so ticks set the system time and let the route read it, rather than passing a time in.
 The Twilio mock is a knob for what the *called party* did (`reached`/`missed`/`pending`) rather than a fake of Twilio's HTTP shape, since that outcome is the only thing driving the retry loop.
 All three escape hatches are pinned there: replying at all must remove everything remaining including the partner alert, answering the phone must remove the remaining calls and the partner alert, and replaying the same tick ten times must send exactly once.
