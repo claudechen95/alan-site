@@ -162,18 +162,23 @@ describe("calling until someone picks up", () => {
 
   it("stops calling once a person answers, and lets them off the partner alert", async () => {
     const log: string[] = [];
-    for (let m = toMin("22:00"); m <= toMin("23:00"); m += 10) {
+    for (let m = toMin("08:00"); m <= toMin("23:00"); m += 10) {
       const at = fmt(m);
-      // The first call connects; every tick after that sees a reached call.
-      if (at === "22:10") phone.outcome = "reached";
+      // The 20:50 call connects; every tick after that sees a reached call.
+      if (at === "21:00") phone.outcome = "reached";
       const seen = { t: texts.length, c: calls.length };
       await tickAt(at);
       for (const t of texts.slice(seen.t)) log.push(`${at} text→${t.to}`);
       for (const c of calls.slice(seen.c)) log.push(`${at} call→${c.to}`);
     }
     // One call, and crucially no partner text - answering is a live acknowledgement, unlike a
-    // snooze, so it ends the day.
-    expect(log).toEqual([`22:00 call→${PHONE}`]);
+    // snooze, so it ends the day for every habit at once.
+    expect(log).toEqual([
+      `18:00 text→${PHONE}`,
+      `19:20 text→${PHONE}`,
+      `20:40 text→${PHONE}`,
+      `20:50 call→${PHONE}`,
+    ]);
   });
 
   it("waits rather than redialling while the previous call is still ringing", async () => {
@@ -250,17 +255,61 @@ describe("replying to a text", () => {
 });
 
 describe("per-habit scheduling", () => {
-  it("gives every habit its own three texts regardless of when it starts", async () => {
+  // The headline of making calls per-habit: two habits on different clocks run two completely
+  // independent ladders, and neither waits for the other.
+  it("gives every habit its own texts and its own call ladder", async () => {
     fakeRedis.seed("tester:goals", [
       { ...salad, nudgeTime: "09:00" },
       { ...salad, id: "gym", name: "Gym", nudgeTime: "18:00" },
     ]);
     const log = await runDay();
-    // The 09:00 habit runs 09:00/13:20/17:40; the 18:00 one runs 18:00/19:20/20:40. They share
-    // the 18:00-ish window without either losing a reminder, and both land in one call.
+
+    // Salad runs 09:00/13:20/17:40 then calls from 17:50; Gym runs 18:00/19:20/20:40 then calls
+    // from 20:50. Gym is still sending its first text after Salad has already been called about.
     expect(log.filter((l) => l.includes(`text→${PHONE}`))).toHaveLength(6);
     expect(log).toContain(`09:00 text→${PHONE}`);
+    expect(log).toContain(`17:50 call→${PHONE}`);
+    expect(log).toContain(`18:00 text→${PHONE}`);
     expect(log).toContain(`20:50 call→${PHONE}`);
+
+    // Each call names only the habit whose ladder reached it.
+    expect(calls[0].script).toContain("1 habit open today: Salad.");
+    expect(calls.at(-1)!.script).toContain("1 habit open today: Gym.");
+  });
+
+  // Regression: when the call was a single per-user ladder pinned near DAY_END, reaching that
+  // cutoff short-circuited the text block, so a habit configured past it got neither a text nor
+  // a call and went silent all day. Per-habit ladders remove the cutoff entirely.
+  it("still nudges and calls a habit configured past DAY_END", async () => {
+    fakeRedis.seed("tester:goals", [{ ...salad, name: "Piano Session", nudgeTime: "22:30" }]);
+    // One text rather than three - nudgeSlots can't divide a span that has already closed - and
+    // then its own call ladder a tick later.
+    expect(await runDay()).toEqual([
+      `22:30 text→${PHONE}`,
+      `22:40 call→${PHONE}`,
+      `22:50 call→${PHONE}`,
+      `23:00 call→${PHONE}`,
+    ]);
+  });
+
+  it("lets a late habit text while an earlier one is already being called about", async () => {
+    fakeRedis.seed("tester:goals", [
+      { ...salad, nudgeTime: "18:00" },
+      { ...salad, id: "piano", name: "Piano Session", nudgeTime: "22:30" },
+    ]);
+    const log = await runDay();
+    expect(log).toContain(`20:50 call→${PHONE}`); // Salad's ladder
+    expect(log).toContain(`22:30 text→${PHONE}`); // Piano's first text, long after
+    expect(log).toContain(`22:40 call→${PHONE}`); // and its own ladder after that
+  });
+
+  it("merges habits whose calls fall due on the same tick into one call", async () => {
+    fakeRedis.seed("tester:goals", [
+      { ...salad, nudgeTime: "18:00" },
+      { ...salad, id: "gym", name: "Gym", nudgeTime: "18:00" },
+    ]);
+    await runDay();
+    // Dialling the same number twice on one tick would put the second call on a busy signal.
     expect(calls[0].script).toContain("2 habits open today: Salad, and Gym");
   });
 

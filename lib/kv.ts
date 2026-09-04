@@ -189,41 +189,48 @@ export interface CallAttempt {
 }
 
 // Claims attempt number `attempt` before dialling, the same before-not-after discipline as
-// claimNudgeSlot: two overlapping dispatch runs must not both ring the phone.
+// claimNudgeSlot: two overlapping dispatch runs must not both ring the phone. Keyed per goal,
+// like the text slots, since each habit runs its own call ladder off its own third text.
 export async function claimCallAttempt(
   userId: string | undefined,
+  goalId: string,
   date: string,
   attempt: number,
   atHHMM: string
 ): Promise<boolean> {
-  const result = await kv.set(k(userId, `nudge:call:${date}:${attempt}`), { at: atHHMM }, {
+  const result = await kv.set(k(userId, `nudge:call:${goalId}:${date}:${attempt}`), { at: atHHMM }, {
     nx: true,
     ex: secondsUntilMidnightPST(),
   });
   return result !== null;
 }
 
-// Safe to overwrite without nx: only the tick that won the claim above ever gets here.
+// Safe to overwrite without nx: only the tick that won the claim above ever gets here. Several
+// habits due on the same tick share one placed call, so they share its sid too.
 export async function recordCallSid(
   userId: string | undefined,
+  goalId: string,
   date: string,
   attempt: number,
   atHHMM: string,
   sid: string
 ): Promise<void> {
-  await kv.set(k(userId, `nudge:call:${date}:${attempt}`), { at: atHHMM, sid }, {
+  await kv.set(k(userId, `nudge:call:${goalId}:${date}:${attempt}`), { at: atHHMM, sid }, {
     ex: secondsUntilMidnightPST(),
   });
 }
 
-// The day's attempts so far, oldest first. Reads the whole fixed-size range in one round trip
+// One habit's attempts so far, oldest first. Reads the whole fixed-size range in one round trip
 // and stops at the first gap, so the array length is the attempt count.
 export async function getCallAttempts(
   userId: string | undefined,
+  goalId: string,
   date: string,
   maxAttempts: number
 ): Promise<CallAttempt[]> {
-  const keys = Array.from({ length: maxAttempts }, (_, i) => k(userId, `nudge:call:${date}:${i}`));
+  const keys = Array.from({ length: maxAttempts }, (_, i) =>
+    k(userId, `nudge:call:${goalId}:${date}:${i}`)
+  );
   const raw = await kv.mget<CallAttempt[]>(...keys);
   const attempts: CallAttempt[] = [];
   for (const entry of raw) {

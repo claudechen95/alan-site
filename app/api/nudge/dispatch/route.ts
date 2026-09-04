@@ -20,8 +20,7 @@ import {
 } from "@/lib/kv";
 import {
   getPendingNudges,
-  getNudgeEligible,
-  callStartTime,
+  habitCallStart,
   nudgeSlots,
   dueSlotIndices,
   callScript,
@@ -66,91 +65,121 @@ export async function POST(req: Request) {
       const pausedIds = new Set(vacation?.goalIds ?? []);
       const goals = (await getGoalStatuses(uid)).filter((g) => !pausedIds.has(g.id));
 
-      // The call is scheduled off everything that will nudge today, not just what's nudging
-      // right now, so an afternoon habit can't pull the escalation forward past the evening
-      // ones - see callStartTime.
-      const eligible = getNudgeEligible(goals, todayDow);
-      const callStart = callStartTime(eligible);
-
       const pendingAll = getPendingNudges(goals, todayDow, nowHHMM);
       if (pendingAll.length === 0) continue;
+
+      // A pickup ends the day outright, for every habit - see markCallReached.
+      if (await isCallReached(uid, today)) continue;
 
       const snoozedFlags = await Promise.all(pendingAll.map((g) => getNudgeSnoozed(uid, g.id, today)));
       const pending = pendingAll.filter((_, i) => !snoozedFlags[i]);
       const snoozed = pendingAll.filter((_, i) => snoozedFlags[i]);
 
-      // Steps 4 and 5. Every habit's third text has landed by callStart, so past this point
-      // there is nothing left to text: it's the call, then the partner, or nothing.
-      if (nowHHMM >= callStart) {
-        // A pickup ends the day outright - see markCallReached.
-        if (await isCallReached(uid, today)) continue;
+      // Steps 1–3. A habit joins this tick's text only if it actually claimed a slot, so a
+      // reminder goes out once per slot rather than once per tick. Texts and calls are both
+      // scheduled per habit and no longer exclude each other: a habit that starts nudging late
+      // can be sending its first text on the same tick another habit is being called about.
+      const dueTexts: typeof pending = [];
+      for (const g of pending) {
+        const indices = dueSlotIndices(nudgeSlots(g.nudgeTime), nowHHMM);
+        const claims = await Promise.all(indices.map((i) => claimNudgeSlot(uid, g.id, today, i)));
+        if (claims.some(Boolean)) dueTexts.push(g);
+      }
 
-        // Claimed off pendingAll, not `pending`, so a fully-snoozed evening still starts the
-        // countdown that step 5 hangs off even though no call will be placed.
+      if (dueTexts.length > 0) {
+        const list = dueTexts.map((g) => `${g.nudgeNumber}. ${g.emoji} ${g.name}`).join("\n");
+        const snoozedLine = snoozed.length > 0
+          ? `\nSnoozed today: ${snoozed.map((g) => `${g.emoji} ${g.name}`).join(", ")}`
+          : "";
+        await sendText(
+          user.phone,
+          `⏰ Still pending:\n${list}\nReply with a number or habit name to snooze just that one for today, or "stop" to snooze all.${snoozedLine}`
+        );
+        results.push({ userId: user.id, step: "text" });
+      }
+
+      // Step 4, one ladder per habit, each hanging off its own last text. Resolving the previous
+      // attempt happens before any new one is claimed, so "keep calling" is driven by what
+      // actually happened rather than by the clock alone.
+      const callable = isCallConfigured();
+      const dueCalls: { goal: (typeof pending)[number]; attempt: number }[] = [];
+      let attemptsRemain = false;
+      let lastAttemptAt: string | null = null;
+      let reached = false;
+
+      // Walks the pre-snooze list: a snoozed habit still starts the countdown that step 5 hangs
+      // off, it just never gets dialled. A fully-snoozed evening therefore still reaches the
+      // partner, which is the whole point of the snooze being a mute button rather than an exit.
+      const snoozedIds = new Set(snoozed.map((g) => g.id));
+      for (const g of pendingAll) {
+        const start = habitCallStart(g.nudgeTime);
+        if (nowHHMM < start) {
+          attemptsRemain = true; // its texts are still running
+          continue;
+        }
         await claimEscalation(uid, today, nowHHMM);
+        if (!callable || snoozedIds.has(g.id)) continue;
 
-        const callable = pending.length > 0 && isCallConfigured();
-        const attempts = callable ? await getCallAttempts(uid, today, MAX_CALL_ATTEMPTS) : [];
+        const attempts = await getCallAttempts(uid, g.id, today, MAX_CALL_ATTEMPTS);
         const last = attempts[attempts.length - 1];
+        if (last?.at && (!lastAttemptAt || last.at > lastAttemptAt)) lastAttemptAt = last.at;
 
-        // Resolve the previous attempt before starting another, so "keep calling" is driven by
-        // what actually happened rather than by the clock alone.
         if (last?.sid) {
           const outcome = await getCallOutcome(last.sid);
-          if (outcome === "pending") continue; // still ringing; decide on the next tick
           if (outcome === "reached") {
-            await markCallReached(uid, today, nowHHMM);
-            results.push({ userId: user.id, step: "reached" });
+            reached = true;
+            break;
+          }
+          if (outcome === "pending") {
+            attemptsRemain = true; // still ringing; decide on the next tick
             continue;
           }
         }
 
-        const nextAt = callable ? nextCallTime(attempts.length, last?.at ?? null, callStart) : null;
-        if (nextAt && nowHHMM >= nextAt) {
-          if (await claimCallAttempt(uid, today, attempts.length, nowHHMM)) {
-            const sid = await placeCall(user.phone, callScript(user.label, pending.map((g) => g.name)));
-            await recordCallSid(uid, today, attempts.length, nowHHMM, sid);
-            results.push({ userId: user.id, step: "call" });
-          }
-          continue;
-        }
-        if (nextAt) continue; // attempts remain, just not due yet
+        const nextAt = nextCallTime(attempts.length, last?.at ?? null, start);
+        if (!nextAt) continue; // this habit's attempts are spent
+        attemptsRemain = true;
+        if (nowHHMM >= nextAt) dueCalls.push({ goal: g, attempt: attempts.length });
+      }
 
-        // Step 5: the calls are spent (or were never possible). The countdown runs from the last
-        // attempt, falling back to the escalation time when nothing could be dialled at all.
-        const base = last?.at ?? (await getEscalationTime(uid, today));
-        if (base && nowHHMM >= addMinutes(base, PARTNER_ALERT_DELAY_MIN)) {
-          if (user.partnerPhone && (await claimPartnerAlert(uid, today))) {
-            // Reported off pendingAll: snoozing mutes your own phone, never your partner's.
-            const names = pendingAll.map((g) => `${g.emoji} ${g.name}`).join(", ");
-            await sendText(user.partnerPhone, `📢 ${user.label} didn't finish today: ${names}`);
-            results.push({ userId: user.id, step: "partner" });
+      if (reached) {
+        await markCallReached(uid, today, nowHHMM);
+        results.push({ userId: user.id, step: "reached" });
+        continue;
+      }
+
+      // Habits due on the same tick share a single call rather than dialling the same number
+      // twice over - the second would land on a busy signal, and one call naming both is what
+      // the user would want anyway.
+      if (dueCalls.length > 0) {
+        const claimed = [];
+        for (const { goal, attempt } of dueCalls) {
+          if (await claimCallAttempt(uid, goal.id, today, attempt, nowHHMM)) {
+            claimed.push({ goal, attempt });
           }
+        }
+        if (claimed.length > 0) {
+          const sid = await placeCall(user.phone, callScript(user.label, claimed.map((c) => c.goal.name)));
+          await Promise.all(
+            claimed.map((c) => recordCallSid(uid, c.goal.id, today, c.attempt, nowHHMM, sid))
+          );
+          results.push({ userId: user.id, step: "call" });
         }
         continue;
       }
 
-      if (pending.length === 0) continue;
-
-      // Steps 1–3. A habit joins this tick's text only if it actually claimed a slot, so a
-      // reminder goes out once per slot rather than once per tick.
-      const due: typeof pending = [];
-      for (const g of pending) {
-        const indices = dueSlotIndices(nudgeSlots(g.nudgeTime), nowHHMM);
-        const claims = await Promise.all(indices.map((i) => claimNudgeSlot(uid, g.id, today, i)));
-        if (claims.some(Boolean)) due.push(g);
+      // Step 5, once no habit has a call attempt left. The countdown runs from the last attempt
+      // placed, falling back to the escalation time when nothing could be dialled at all.
+      if (attemptsRemain) continue;
+      const base = lastAttemptAt ?? (await getEscalationTime(uid, today));
+      if (base && nowHHMM >= addMinutes(base, PARTNER_ALERT_DELAY_MIN)) {
+        if (user.partnerPhone && (await claimPartnerAlert(uid, today))) {
+          // Reported off pendingAll: snoozing mutes your own phone, never your partner's.
+          const names = pendingAll.map((g) => `${g.emoji} ${g.name}`).join(", ");
+          await sendText(user.partnerPhone, `📢 ${user.label} didn't finish today: ${names}`);
+          results.push({ userId: user.id, step: "partner" });
+        }
       }
-      if (due.length === 0) continue;
-
-      const list = due.map((g) => `${g.nudgeNumber}. ${g.emoji} ${g.name}`).join("\n");
-      const snoozedLine = snoozed.length > 0
-        ? `\nSnoozed today: ${snoozed.map((g) => `${g.emoji} ${g.name}`).join(", ")}`
-        : "";
-      await sendText(
-        user.phone,
-        `⏰ Still pending:\n${list}\nReply with a number or habit name to snooze just that one for today, or "stop" to snooze all.${snoozedLine}`
-      );
-      results.push({ userId: user.id, step: "text" });
     } catch (err) {
       console.error(`Nudge dispatch failed for ${user.id}:`, err);
       // Don't let one user's failure abort the whole batch.

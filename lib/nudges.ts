@@ -102,17 +102,18 @@ export function callScript(label: string, habitNames: string[]): string {
   );
 }
 
-// Everything that will nudge at some point today, whether or not its time has come yet. Split
-// out from getPendingNudges because the call has to be scheduled against habits that haven't
-// started nudging: an afternoon habit whose three texts finish at 19:40 must not drag the phone
-// call forward to 19:50 and spend all three attempts before the 21:00 habits have sent a single
-// reminder.
-export function getNudgeEligible(goals: GoalStatus[], todayDow: number): GoalStatus[] {
+// The single source of truth for "is this habit still pending" - the text dispatch, the call,
+// the partner alert, and the inbound reply matcher all run off it, so they can't disagree.
+export function getPendingNudges(goals: GoalStatus[], todayDow: number, nowHHMM: string): GoalStatus[] {
   return goals.filter((g) => {
     // Graduated habits aren't tracked any more, so they're never pending. (getGoalStatuses
     // already reports them as complete, which would exclude them anyway - this is the explicit
     // statement of why, so the reason survives any change to how a graduated status is shaped.)
     if (g.graduatedAt) return false;
+
+    // A habit doesn't enter the ladder until its configured reminder time has passed for the
+    // day - that time is also its first text slot (see nudgeSlots).
+    if ((g.nudgeTime ?? DEFAULT_NUDGE_TIME) > nowHHMM) return false;
 
     if (g.frequency === "daily") {
       return g.nudgeEnabled !== false && g.completedThisPeriod < g.targetCount;
@@ -124,34 +125,14 @@ export function getNudgeEligible(goals: GoalStatus[], todayDow: number): GoalSta
   });
 }
 
-// The single source of truth for "is this habit still pending" - the text dispatch, the call,
-// the partner alert, and the inbound reply matcher all run off it, so they can't disagree. It's
-// the eligible set gated on the clock: a habit doesn't enter the ladder until its configured
-// reminder time has passed, which is also its first text slot (see nudgeSlots).
-export function getPendingNudges(goals: GoalStatus[], todayDow: number, nowHHMM: string): GoalStatus[] {
-  return getNudgeEligible(goals, todayDow).filter(
-    (g) => (g.nudgeTime ?? DEFAULT_NUDGE_TIME) <= nowHHMM
-  );
-}
-
-// When the first call goes out: one tick after the last of the day's habits has sent its third
-// text, so a text always gets a chance to be acted on before the phone rings. Computed over the
-// *eligible* set rather than the pending one, so the ladder waits for habits that haven't
-// started nudging yet.
+// When *this habit's* calls begin: one tick after its own last text, so a text always gets a
+// chance to be acted on before the phone rings for it. Per-habit rather than per-user, exactly
+// like the text slots - a habit's escalation is a consequence of its own reminders going
+// unanswered, and shouldn't wait on an unrelated habit that nudges later in the evening.
 //
-// Habits configured at or past DAY_END are excluded from the maximum: nudgeSlots can't divide a
-// span that has already closed, so they get a single text rather than three and would otherwise
-// drag the whole escalation to the cap. The cap itself keeps the ladder inside the dispatch
-// window - with retries and the partner alert hanging off it, a later start would run out of
-// ticks before finishing.
-export function callStartTime(eligible: GoalStatus[]): string {
-  const thirdTexts = eligible
-    .map((g) => nudgeSlots(g.nudgeTime))
-    .filter((slots) => slots.length === NUDGE_TEXT_COUNT)
-    .map((slots) => slots[slots.length - 1]);
-
-  if (thirdTexts.length === 0) return DAY_END;
-  const last = thirdTexts.reduce((a, b) => (b > a ? b : a));
-  const start = addMinutes(last, ESCALATION_DELAY_MIN);
-  return start > DAY_END ? DAY_END : start;
+// Uncapped: a habit configured past DAY_END gets one text instead of three (nudgeSlots can't
+// divide a closed span) and calls a tick after that, rather than being dropped from the ladder.
+export function habitCallStart(nudgeTime?: string): string {
+  const slots = nudgeSlots(nudgeTime);
+  return addMinutes(slots[slots.length - 1], ESCALATION_DELAY_MIN);
 }

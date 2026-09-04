@@ -1,8 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   getPendingNudges,
-  getNudgeEligible,
-  callStartTime,
+  habitCallStart,
   nudgeSlots,
   dueSlotIndices,
   callScript,
@@ -182,54 +181,27 @@ describe("nextCallTime", () => {
   });
 });
 
-// The call is meant to read as the consequence of the third text going unanswered, so it's
-// scheduled off that text rather than off the wall clock.
-describe("callStartTime", () => {
-  const habit = (nudgeTime: string) => status({ id: nudgeTime, nudgeTime });
-
-  it("fires one tick after a habit's third text", () => {
-    // 21:00 habit texts at 21:00 / 21:20 / 21:40.
-    expect(callStartTime([habit("21:00")])).toBe("21:50");
+// Each habit's calls hang off its own last text, exactly like its text slots hang off its own
+// nudge time - the escalation is a consequence of that habit's reminders going unanswered.
+describe("habitCallStart", () => {
+  it("fires one tick after the habit's third text", () => {
+    expect(habitCallStart("21:00")).toBe("21:50"); // texts 21:00 / 21:20 / 21:40
+    expect(habitCallStart("18:00")).toBe("20:50"); // texts 18:00 / 19:20 / 20:40
   });
 
-  it("waits for the latest habit, so an early one can't pull the call forward", () => {
-    // The 13:25 habit is done texting at 19:08, but calling then would spend all three attempts
-    // before the 21:00 habit had sent a single reminder.
-    expect(callStartTime([habit("13:25"), habit("21:00")])).toBe("21:50");
+  it("gives an early habit an early ladder, independent of any other habit", () => {
+    expect(habitCallStart("13:25")).toBe("19:18");
   });
 
-  it("never starts later than DAY_END, which keeps the ladder inside the dispatch window", () => {
-    // A 21:30 habit's third text lands at 21:50, and 22:00 rather than 22:00+ is the start.
-    expect(callStartTime([habit("21:30")])).toBe(DAY_END);
+  it("defaults an unset nudge time to 21:00, matching getPendingNudges", () => {
+    expect(habitCallStart(undefined)).toBe(habitCallStart("21:00"));
   });
 
-  it("ignores habits configured past DAY_END, which never get three texts at all", () => {
-    // A 22:30 habit gets one text, not three, so it has no third text to escalate from - it
-    // must not drag every other habit's call out to the cap.
-    expect(callStartTime([habit("21:00"), habit("22:30")])).toBe("21:50");
-  });
-
-  it("falls back to DAY_END when nothing has a full text schedule", () => {
-    expect(callStartTime([habit("22:30")])).toBe(DAY_END);
-    expect(callStartTime([])).toBe(DAY_END);
-  });
-});
-
-// getPendingNudges is getNudgeEligible gated on the clock; the split exists so the call can be
-// scheduled against habits that haven't started nudging yet.
-describe("getNudgeEligible", () => {
-  it("includes a habit whose nudge time hasn't arrived, unlike getPendingNudges", () => {
-    const goals = [status({ id: "late", nudgeTime: "21:00" })];
-    expect(getNudgeEligible(goals, 3).map((g) => g.id)).toEqual(["late"]);
-    expect(getPendingNudges(goals, 3, "18:00")).toEqual([]);
-    expect(getPendingNudges(goals, 3, "21:00").map((g) => g.id)).toEqual(["late"]);
-  });
-
-  it("still excludes graduated and completed habits", () => {
-    const goals = [
-      status({ id: "graduated", nudgeTime: "21:00", graduatedAt: "2026-08-01" }),
-      status({ id: "done", nudgeTime: "21:00", completedThisPeriod: 1, targetCount: 1 }),
-    ];
-    expect(getNudgeEligible(goals, 3)).toEqual([]);
+  // A habit past DAY_END gets one text rather than three, and calls a tick after that instead
+  // of being dropped from the ladder - which is what used to happen when the call was
+  // scheduled once per user against a fixed cutoff.
+  it("still escalates a habit configured past DAY_END", () => {
+    expect(habitCallStart("22:30")).toBe("22:40");
+    expect(habitCallStart("22:00")).toBe("22:10");
   });
 });
