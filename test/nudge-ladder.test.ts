@@ -205,6 +205,35 @@ describe("calling until someone picks up", () => {
   });
 });
 
+// Carriers intercept these ahead of Sendblue on SMS and block every future message from the
+// sender permanently, without ever delivering the inbound webhook - so the ladder would keep
+// calling and alerting the partner about texts that can no longer arrive. Nothing we send may
+// invite one.
+describe("carrier opt-out keywords", () => {
+  // Sendblue's documented auto-detected set, plus the carrier-standard ones it doesn't list.
+  const RESERVED = [
+    "stop", "stopall", "unsubscribe", "cancel", "opt out", "revoke",
+    "end", "quit", "start", "unstop",
+  ];
+
+  it("never instructs the user to send one", async () => {
+    await runDay();
+    expect(texts.length).toBeGreaterThan(0);
+    for (const t of texts) {
+      // Whole words only: "pending" legitimately contains "end".
+      const used = RESERVED.filter((w) => new RegExp(`\\b${w}\\b`, "i").test(t.body));
+      expect(used, `"${t.body}" invites the reserved keyword(s) ${used.join(", ")}`).toEqual([]);
+    }
+  });
+
+  // Naming a safe word matters more than it looks: "reply anything" is an invitation to
+  // improvise, and "stop" or "cancel" are the obvious things to improvise.
+  it("names a harmless word rather than inviting a free-form reply", async () => {
+    await runDay();
+    expect(texts[0].body).toContain(`Reply "pause" to mute today's nudges.`);
+  });
+});
+
 describe("snoozing", () => {
   // The whole point of the design: a snooze is a mute button on your own phone, not an exit
   // from the accountability. Only finishing the habit stops step 5.

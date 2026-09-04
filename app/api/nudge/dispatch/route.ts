@@ -91,9 +91,16 @@ export async function POST(req: Request) {
         const snoozedLine = snoozed.length > 0
           ? `\nSnoozed today: ${snoozed.map((g) => `${g.emoji} ${g.name}`).join(", ")}`
           : "";
+        // Suggests a safe word rather than saying "reply anything", even though any reply does
+        // end the day (markReplied). Sendblue auto-detects stop/unsubscribe/cancel/opt out/
+        // revoke/end/quit and the carrier intercepts them ahead of Sendblue on SMS: any of those
+        // permanently blocks every future message to this number, transactional included, and
+        // never delivers the inbound webhook - so the ladder would keep calling and alerting the
+        // partner about texts that can no longer arrive. Inviting a free-form reply invites
+        // someone to improvise exactly one of those words, so we name a harmless one instead.
         await sendText(
           user.phone,
-          `⏰ Still pending:\n${list}\nReply with a number or habit name to snooze just that one for today, or "stop" to snooze all.${snoozedLine}`
+          `⏰ Still pending:\n${list}\nReply "pause" to mute today's nudges.${snoozedLine}`
         );
         results.push({ userId: user.id, step: "text" });
       }
