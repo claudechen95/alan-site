@@ -15,7 +15,13 @@ export class FakeRedis {
     return (this.store.get(key) as T) ?? null;
   }
 
-  async set(key: string, value: unknown): Promise<"OK"> {
+  // `nx` has to be honoured, not ignored: the nudge ladder's guarantee that a reminder can't
+  // double-send is entirely "did SET NX return OK or null", so a fake that always says OK would
+  // make a broken dispatch look correct. `ex` is accepted and dropped - nothing in the tests
+  // runs long enough for a TTL to matter, and faking expiry would need a clock the fake doesn't
+  // have.
+  async set(key: string, value: unknown, opts?: { nx?: boolean; ex?: number }): Promise<"OK" | null> {
+    if (opts?.nx && (this.store.has(key) || this.lists.has(key))) return null;
     this.store.set(key, value);
     return "OK";
   }

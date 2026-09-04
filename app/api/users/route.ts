@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getUsers, addUser, removeUser, setUserPhone } from "@/lib/kv";
+import { getUsers, addUser, removeUser, setUserPhone, setUserPartnerPhone } from "@/lib/kv";
 
 export async function GET() {
   return NextResponse.json(await getUsers());
@@ -15,9 +15,11 @@ export async function POST(req: Request) {
 }
 
 export async function PATCH(req: Request) {
-  const { id, phone } = await req.json();
+  const { id, phone, partnerPhone } = await req.json();
   if (!id) return NextResponse.json({ error: "id required" }, { status: 400 });
-  await setUserPhone(id, phone ?? "");
+  // Each number is only touched when its key is present, so editing one can't blank the other.
+  if (phone !== undefined) await setUserPhone(id, phone);
+  if (partnerPhone !== undefined) await setUserPartnerPhone(id, partnerPhone);
   return NextResponse.json({ ok: true });
 }
 

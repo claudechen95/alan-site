@@ -36,7 +36,13 @@ export default async function AdminPage() {
               </div>
               <div className="space-y-1.5">
                 <TopicRow label="Completions" topic={checkin} />
-                <EditPhoneForm id={user.id} phone={user.phone ?? null} />
+                <EditPhoneForm id={user.id} field="phone" label="Phone" value={user.phone ?? null} />
+                <EditPhoneForm
+                  id={user.id}
+                  field="partnerPhone"
+                  label="Partner"
+                  value={user.partnerPhone ?? null}
+                />
               </div>
             </div>
           );

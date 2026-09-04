@@ -36,7 +36,7 @@ The topic is stored inside the `UserRecord` in Redis (`checkinTopic`). The check
 
 ### Notification env vars per user
 
-There is no in-app nudge modal anymore — pending goals are surfaced entirely via escalating text messages (below) for users with a phone number configured. The habit-completion push notification still fires when a user checks off a goal, so their accountability partner sees it:
+There is no in-app nudge modal anymore — pending goals are surfaced entirely via the escalating text/call ladder (below) for users with a phone number configured. The habit-completion push notification still fires when a user checks off a goal, so their accountability partner sees it:
 
 | User | Completed habit |
 |------|----------------|
@@ -45,17 +45,39 @@ There is no in-app nudge modal anymore — pending goals are surfaced entirely v
 | Rochisha | `NTFY_ROCHISHA_TOPIC` |
 | Future | `NTFY_{USER_UPPER}_TOPIC` |
 
-### Escalating text nudges (Sendblue + cron-job.org)
+### Escalating nudges (Sendblue + Twilio + cron-job.org)
 
-Any user with a `phone` set (via `/admin`, or `PATCH /api/users`) gets a text via [Sendblue](https://docs.sendblue.com) every hour, 8am–9pm PST, listing whichever habits are still pending — until they either complete the check-in or text back a reply. `lib/nudges.ts`'s `getPendingNudges` is the single source of truth for "is this goal pending". Vacation-paused goals (`getActiveVacation`) are excluded. A habit's `nudgeTime` (set per-goal in the habit form) gates when it *enters* the rotation — e.g. set to 6pm, the earliest possible nudge for that habit is the 6pm tick, then hourly after; it defaults to `"21:00"` if unset.
+Any user with a `phone` set (via `/admin`, or `PATCH /api/users`) climbs a five-step ladder each day, per habit, until they complete the check-in.
+`lib/nudges.ts` owns the whole schedule and is pure - the clock, weekday, and habit list are passed in - so nothing else computes when a step is due.
 
-- **`app/api/nudge/dispatch/route.ts`** — the hourly tick. Requires header `x-nudge-secret` matching `NUDGE_DISPATCH_SECRET` (rejects with 401 otherwise — there is no unauthenticated path). Scheduled externally via [cron-job.org](https://cron-job.org)'s API (Vercel's Hobby-plan Cron can't run more than once/day, so it can't be used here) — the schedule itself encodes the 8am–9pm PST window via `schedule.hours`/`schedule.timezone`, and sends `x-nudge-secret` as a custom request header.
+`normalizePhone` in `lib/kv.ts` canonicalizes both numbers to E.164 on write, and `findUserByPhone` normalizes both sides of the comparison so numbers stored before it existed still match.
+This is load-bearing for inbound replies only: Sendblue and Twilio both parse loose forms like `+1 929 213 7480` on *send*, but Sendblue reports an inbound sender in strict E.164, so a formatted stored number silently matched no user and dropped every snooze.
+
+| Step | When | What |
+|------|------|------|
+| 1-3 | `nudgeTime`, then evenly spread to `DAY_END` | Text via Sendblue |
+| 4 | `DAY_END` (22:00 PST) | Phone call via Twilio |
+| 5 | 30 min after step 4 (`PARTNER_ALERT_DELAY_MIN`) | Text to the user's `partnerPhone` |
+
+The times come from the *habit*, not from the cron tick: `nudgeSlots(nudgeTime)` divides the span from `nudgeTime` to `DAY_END` into thirds, so a habit always gets exactly three texts before the call.
+Set to 9am they land 4h20m apart (9:00, 13:20, 17:40); set to 9pm they land 20 minutes apart (21:00, 21:20, 21:40).
+`nudgeTime` defaults to `"21:00"` and the habit form caps it at 21:00, since past that there's no span left to divide.
+`getPendingNudges` is the single source of truth for "is this goal pending", and gates a habit out of the ladder entirely until its `nudgeTime` has passed.
+Vacation-paused goals (`getActiveVacation`) and graduated goals are excluded.
+
+**Snoozing silences your own phone but never your partner.**
+Steps 1-4 respect `nudge:snoozed:{goalId}:{date}`; step 5 deliberately runs off the *pre-snooze* pending list, so only actually completing a habit keeps it from reaching your partner.
+For the same reason `claimEscalation` records the escalation *step* rather than the call - it's claimed even when the call is suppressed (everything snoozed) or impossible (no Twilio credentials), because step 5's countdown hangs off that timestamp.
+
+- **`app/api/nudge/dispatch/route.ts`** — the tick. Requires header `x-nudge-secret` matching `NUDGE_DISPATCH_SECRET` (rejects with 401 otherwise — there is no unauthenticated path). Scheduled externally via [cron-job.org](https://cron-job.org)'s API (Vercel's Hobby-plan Cron can't run more than once/day, so it can't be used here) — the schedule encodes an **every-10-minutes, 8am–11pm PST** window via `schedule.hours`/`schedule.minutes`/`schedule.timezone`, and sends `x-nudge-secret` as a custom request header. The tick rate itself carries no meaning; it only has to be at least as frequent as the tightest slot spacing (20 min, for a 21:00 habit) and must cover 22:00 and 22:30 for steps 4 and 5.
+- **`lib/call.ts`** — `placeCall` is the only place that talks to a voice provider, the same seam `lib/sendblue.ts` gives texts. Inline TwiML (no hosted callback URL, since the call is one-way, so there's no public webhook to authenticate), `Polly.Matthew`, `loop="2"` because a single pass is easy to miss on pickup, and habit names spoken without emoji, which read badly in TTS. `callScript` in `lib/nudges.ts` builds the spoken text. `isCallConfigured()` gates on the Twilio env vars being present, so an unconfigured deployment just stops the ladder after step 3 instead of erroring every tick.
 - **`app/api/nudge/inbound/route.ts`** — Sendblue's inbound-webhook target, registered via `POST https://api.sendblue.com/api/account/webhooks` with a chosen `secret`. Requires that secret to be echoed back (checked against `sb-webhook-secret`/`sb-signing-secret` headers or a `secret` body field — Sendblue's docs don't pin down the exact one, so all are checked; unverified requests always 401). Sendblue has no reply-to/thread field, so a reply is matched against the sender's *currently pending* habits by number or name (`nudge:snoozed:{goalId}:{date}`, per-goal) — naming a habit or its `nudgeNumber` snoozes just that one for the rest of the PST day; an explicit "stop"/"all"/"stop all"/"snooze all" reply snoozes everything pending. Anything else (a stray "ok", "on it", etc.) snoozes nothing — silence has to be intentional, not the default outcome of any reply.
 - **`Goal.nudgeNumber`** (`lib/types.ts`) — a stable 1..N id per user, shown in nudge texts ("2. 🏋️ Gym") so a reply like "2" always means the same habit. `renumberGoals()` in `lib/kv.ts` reassigns it compactly whenever a goal is added or deleted (called from `app/api/goals/route.ts`'s `POST`/`DELETE`), and `getGoals()` backfills it for any pre-existing goal missing it. It tracks each goal's storage/creation order, not its drag-reordered display position — a habit's nudge number and its position in the home-screen list can differ.
-- `lib/kv.ts`'s `claimNudgeSlot(userId, date, hour)` atomically claims (`SET NX EX`) a per-hour send slot *before* texting, so overlapping/retried dispatch calls for the same hour can never double-send.
+- Every step claims its slot (`SET NX EX`, all expiring at PST midnight) *before* sending, so overlapping or retried dispatch calls can never double-send: `claimNudgeSlot(userId, goalId, date, slotIndex)` → `nudge:sent:{goalId}:{date}:{slot}` (per goal, so each habit escalates on its own schedule), `claimEscalation` → `nudge:escalated:{date}`, `claimPartnerAlert` → `nudge:partner-alerted:{date}`.
+- `dueSlotIndices` returns *every* passed slot, not just the latest, so a dispatch outage burns the slots it slept through rather than replaying them one per later tick, which would push a habit's third text past the call it's meant to precede.
 - `lib/sendblue.ts`'s `sendText` is the only place that calls the Sendblue send API.
 
-Env vars: `SENDBLUE_API_KEY`, `SENDBLUE_API_SECRET`, `SENDBLUE_FROM_NUMBER`, `SENDBLUE_WEBHOOK_SECRET` (chosen by us, used both when registering the webhook and to verify inbound requests), `NUDGE_DISPATCH_SECRET` (chosen by us, given to cron-job.org as a custom header).
+Env vars: `SENDBLUE_API_KEY`, `SENDBLUE_API_SECRET`, `SENDBLUE_FROM_NUMBER`, `SENDBLUE_WEBHOOK_SECRET` (chosen by us, used both when registering the webhook and to verify inbound requests), `NUDGE_DISPATCH_SECRET` (chosen by us, given to cron-job.org as a custom header), `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`.
 
 ## Data model
 Goals are stored as a JSON array at Redis key `goals` (Alan) or `{userId}:goals` (others).
@@ -189,11 +211,16 @@ Env vars needed: `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` (in `.env.
 
 Vitest, in `test/`. `.github/workflows/ci.yml` runs lint → typecheck → test → build on every push to `main` and every PR.
 
-**No live Redis.** `test/setup.ts` mocks `@upstash/redis` so every `new Redis(...)` returns the shared in-memory `FakeRedis` from `test/redis-fake.ts`. That fake implements exactly the command surface `lib/kv.ts` uses and preserves the Upstash semantics `kv.ts` depends on (`mget` returns `null` for missing keys, lists are newest-first via `lpush`). Add a command to `kv.ts` and the fake needs it too — better a loud failure than a silent `undefined`.
+**No live Redis.** `test/setup.ts` mocks `@upstash/redis` so every `new Redis(...)` returns the shared in-memory `FakeRedis` from `test/redis-fake.ts`. That fake implements exactly the command surface `lib/kv.ts` uses and preserves the Upstash semantics `kv.ts` depends on (`mget` returns `null` for missing keys, lists are newest-first via `lpush`, and `set` with `nx` returns `null` rather than `"OK"` when the key exists — the nudge ladder's no-double-send guarantee is exactly that return value, so a fake that always said `"OK"` would make a broken dispatch look correct). Add a command to `kv.ts` and the fake needs it too — better a loud failure than a silent `undefined`.
 
 **Time is pinned.** The data-layer suites `vi.setSystemTime` to Wed 26 Aug 2026. That date is deliberate: a Wednesday leaves 5 days in the week, which is the only way to construct both the "still winnable" and "already out of reach" weekly-goal cases. Never write a test that depends on the day it happens to run — an earlier throwaway script did, and its "out of reach" case was unconstructible on Mondays, so it failed every Monday for no real reason.
 
-Suites: `week-keys` (ISO week numbering, incl. a 400-day sweep across both year boundaries and a guard pinning already-stored note keys to their labels), `reflection` (every branch of `getReflectionPrompt`), `graduation` (eligibility, freeze/restore, the untracked guarantees), `nudges` (the pure `getPendingNudges` predicate).
+Suites: `week-keys` (ISO week numbering, incl. a 400-day sweep across both year boundaries and a guard pinning already-stored note keys to their labels), `reflection` (every branch of `getReflectionPrompt`), `graduation` (eligibility, freeze/restore, the untracked guarantees), `nudges` (the pure `getPendingNudges` predicate, plus the escalation schedule: `nudgeSlots`, `dueSlotIndices`, `addMinutes`, `callScript`), `nudge-ladder` (the dispatch route end to end).
+
+`nudge-ladder` is the one suite that drives an API route rather than the data layer.
+It replays a whole PST day at the real cron cadence (a POST every 10 simulated minutes, 8am–11pm) with Sendblue and Twilio mocked, and asserts the exact transcript of what went out and when — `18:00 text`, `19:20 text`, `20:40 text`, `22:00 call`, `22:30 partner text`.
+The clock is the input under test, so ticks set the system time and let the route read it, rather than passing a time in.
+Both escape hatches are pinned there too: a snooze must remove the texts and the call but *not* the partner alert, and replaying the same tick ten times must send exactly once.
 
 `scripts/seed-reflection-demo.mts` is *not* a test — it seeds a disposable `reflectdemo` user against live Redis for manual browser QA of the modals and trophy shelf, which unit tests can't cover. `npx tsx --env-file=.env.local scripts/seed-reflection-demo.mts [clean]`.
 

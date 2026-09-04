@@ -141,12 +141,52 @@ export async function setNudgeSnoozed(userId: string | undefined, goalId: string
   await kv.set(k(userId, `nudge:snoozed:${goalId}:${date}`), 1, { ex: secondsUntilMidnightPST() });
 }
 
-// Atomically claims this user's send slot for the given PST hour. Returns true if this call
-// claimed it (i.e. no nudge has been sent this hour yet), false if another invocation already did.
-// Claiming BEFORE sending — rather than checking a "last sent" timestamp and writing after —
-// means two overlapping/retried dispatch runs for the same hour can't both pass the check.
-export async function claimNudgeSlot(userId: string | undefined, date: string, hour: number): Promise<boolean> {
-  const result = await kv.set(k(userId, `nudge:sent:${date}:${hour}`), 1, { nx: true, ex: 3540 });
+// Atomically claims one of a habit's three text slots for the day (slot times come from
+// nudgeSlots in lib/nudges.ts). Returns true if this call claimed it, false if an earlier tick
+// already sent that reminder. Claiming BEFORE sending — rather than checking a "last sent"
+// timestamp and writing after — means two overlapping or retried dispatch runs can't both pass
+// the check. Keyed per goal rather than per user so each habit escalates on its own schedule.
+export async function claimNudgeSlot(
+  userId: string | undefined,
+  goalId: string,
+  date: string,
+  slotIndex: number
+): Promise<boolean> {
+  const result = await kv.set(k(userId, `nudge:sent:${goalId}:${date}:${slotIndex}`), 1, {
+    nx: true,
+    ex: secondsUntilMidnightPST(),
+  });
+  return result !== null;
+}
+
+// Claims the once-a-day moment the ladder runs out of texts, storing the PST time it happened
+// so the partner alert can be scheduled relative to the real event rather than a hardcoded hour.
+// This is the escalation *step*, not the call: it's claimed even when the call is suppressed
+// (everything snoozed) or impossible (no Twilio credentials), because the partner alert hangs
+// off this timestamp and must not depend on either.
+export async function claimEscalation(
+  userId: string | undefined,
+  date: string,
+  atHHMM: string
+): Promise<boolean> {
+  const result = await kv.set(k(userId, `nudge:escalated:${date}`), atHHMM, {
+    nx: true,
+    ex: secondsUntilMidnightPST(),
+  });
+  return result !== null;
+}
+
+export async function getEscalationTime(userId: string | undefined, date: string): Promise<string | null> {
+  return await kv.get<string>(k(userId, `nudge:escalated:${date}`));
+}
+
+// Claims the one "your partner didn't finish" text per user per day. Deliberately separate from
+// the call claim: the call and the alert fire on different ticks, so one key can't gate both.
+export async function claimPartnerAlert(userId: string | undefined, date: string): Promise<boolean> {
+  const result = await kv.set(k(userId, `nudge:partner-alerted:${date}`), 1, {
+    nx: true,
+    ex: secondsUntilMidnightPST(),
+  });
   return result !== null;
 }
 
@@ -879,7 +919,8 @@ export interface UserRecord {
   id: string;
   label: string;
   checkinTopic?: string; // ntfy topic for habit completions
-  phone?: string; // E.164 number for escalating text nudges (Sendblue)
+  phone?: string; // E.164 number for escalating text nudges (Sendblue) and the escalation call
+  partnerPhone?: string; // E.164 number told when the ladder runs out (see lib/nudges.ts)
 }
 
 const DEFAULT_USERS: UserRecord[] = [
@@ -903,7 +944,7 @@ export async function addUser(
 ): Promise<void> {
   const users = await getUsers();
   if (users.find((u) => u.id === id)) return;
-  users.push({ id, label, checkinTopic, phone });
+  users.push({ id, label, checkinTopic, phone: phone ? normalizePhone(phone) : undefined });
   await kv.set("users", users);
 }
 
@@ -912,18 +953,41 @@ export async function removeUser(id: string): Promise<void> {
   await kv.set("users", users.filter((u) => u.id !== id));
 }
 
+// Numbers are typed by hand into /admin, so "+1 929 213 7480" and "(929) 213-7480" both arrive
+// meaning the same phone. Sendblue and Twilio each accept those loose forms on send, which hides
+// the problem until an inbound reply - Sendblue reports the sender in strict E.164, so a stored
+// number that isn't already E.164 matches nothing and the snooze is silently dropped. Normalizing
+// on write keeps storage canonical; findUserByPhone normalizes both sides anyway, so numbers
+// stored before this still match.
+export function normalizePhone(phone: string): string {
+  const digits = phone.replace(/\D/g, "");
+  if (!digits) return "";
+  // A bare 10-digit US number is the common /admin typo; anything else is assumed to already
+  // carry its country code.
+  return digits.length === 10 ? `+1${digits}` : `+${digits}`;
+}
+
 export async function setUserPhone(id: string, phone: string): Promise<void> {
   const users = await getUsers();
   const user = users.find((u) => u.id === id);
   if (!user) return;
-  user.phone = phone || undefined;
+  user.phone = normalizePhone(phone) || undefined;
+  await kv.set("users", users);
+}
+
+export async function setUserPartnerPhone(id: string, phone: string): Promise<void> {
+  const users = await getUsers();
+  const user = users.find((u) => u.id === id);
+  if (!user) return;
+  user.partnerPhone = normalizePhone(phone) || undefined;
   await kv.set("users", users);
 }
 
 // Finds the UserRecord whose phone number matches an inbound text's sender number.
 export async function findUserByPhone(phone: string): Promise<UserRecord | undefined> {
   const users = await getUsers();
-  return users.find((u) => u.phone === phone);
+  const target = normalizePhone(phone);
+  return users.find((u) => u.phone && normalizePhone(u.phone) === target);
 }
 
 // Resolve ntfy topic for habit-completion notifications: checks Redis UserRecord first,
